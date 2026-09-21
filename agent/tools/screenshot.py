@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 from ..registry import ToolError, register
 from ..backends import get_backend
 
-SCREENSHOTS_DIR = Path(os.path.expanduser("~")) / "Pictures" / "ElysiaScreenshots"
+SCREENSHOTS_DIR = Path(os.path.expanduser("~")) / "Pictures" / "AkariScreenshots"
 
 
 def _image_to_b64(img, fmt="PNG", quality=70) -> str:
@@ -81,6 +81,42 @@ def _trim_ocr(text: str, max_chars: int = 1500) -> str:
     return out
 
 
+def _extract_window_text(hwnd: Any) -> str:
+    texts = []
+    if not hwnd:
+        return ""
+    try:
+        import win32gui
+        def enum_child(child_hwnd, _):
+            try:
+                txt = win32gui.GetWindowText(child_hwnd)
+                if txt and len(txt.strip()) > 1 and txt.strip() not in texts:
+                    texts.append(txt.strip())
+            except Exception:
+                pass
+            return True
+        win32gui.EnumChildWindows(hwnd, enum_child, None)
+    except Exception:
+        pass
+    return " | ".join(texts[:40])
+
+
+def _get_visible_windows() -> list[str]:
+    titles = []
+    try:
+        import win32gui
+        def enum_win(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                txt = win32gui.GetWindowText(hwnd)
+                if txt and txt not in ["Program Manager", "Default IME", "MSCTFIME UI"] and txt not in titles:
+                    titles.append(txt.strip())
+            return True
+        win32gui.EnumWindows(enum_win, None)
+    except Exception:
+        pass
+    return titles[:12]
+
+
 @register("takeScreenshot")
 def take_screenshot(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -88,22 +124,24 @@ def take_screenshot(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         raise ToolError(str(e))
         
-    include_image = bool(args.get("include_image", False))
+    include_image = bool(args.get("include_image", True))
+    max_dim = int(args.get("max_dim", 1440))
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        img_small = img.resize(
+            (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+        )
+    else:
+        img_small = img
+
     result: Dict[str, Any] = {
         "result": f"Captured screen ({img.width}x{img.height}).",
         "width": img.width,
         "height": img.height,
+        "visible_windows": _get_visible_windows(),
     }
     if include_image:
-        max_dim = int(args.get("max_dim", 1280))
-        if max(img.size) > max_dim:
-            ratio = max_dim / max(img.size)
-            img_small = img.resize(
-                (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
-            )
-        else:
-            img_small = img
-        result["image_base64"] = _image_to_b64(img_small, fmt="JPEG", quality=60)
+        result["image_base64"] = _image_to_b64(img_small, fmt="JPEG", quality=75)
         result["image_mime"] = "image/jpeg"
     return result
 
@@ -131,45 +169,76 @@ def analyze_screenshot(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         raise ToolError(str(e))
         
+    max_dim = int(args.get("max_dim", 1440))
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        img_small = img.resize(
+            (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+        )
+    else:
+        img_small = img
+
+    text = ""
     try:
         text = _run_ocr(img)
-    except ToolError as e:
-        return {"result": f"Screenshot captured, but OCR unavailable: {e.message}"}
-    return {
-        "result": "Screenshot analyzed via OCR.",
-        "text": _trim_ocr(text, int(args.get("max_chars", 1500))),
+    except Exception:
+        pass
+
+    windows = _get_visible_windows()
+    res: Dict[str, Any] = {
+        "result": "Screen visual captured and analyzed.",
+        "visible_windows": windows,
+        "image_base64": _image_to_b64(img_small, fmt="JPEG", quality=75),
+        "image_mime": "image/jpeg"
     }
+    if text and "[OCR Error" not in text:
+        res["ocr_text"] = _trim_ocr(text, int(args.get("max_chars", 1500)))
+    return res
 
 
 @register("readScreen")
 def read_screen(args: Dict[str, Any]) -> Dict[str, Any]:
-    """OCR the active window and report its title + visible text."""
+    """Capture screen and active window to inspect title, UI text, and visual content."""
     backend = get_backend()
     hwnd = backend.window_manager.get_foreground_window()
     title = backend.window_manager.get_window_title(hwnd) if hwnd else ""
     bbox = backend.screenshot.active_window_bbox()
     
     try:
-        if bbox:
-            img = backend.screenshot.capture_region(bbox)
-        else:
-            img = backend.screenshot.capture()
+        img = backend.screenshot.capture()
     except Exception as e:
         raise ToolError(str(e))
         
+    max_dim = int(args.get("max_dim", 1440))
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        img_small = img.resize(
+            (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+        )
+    else:
+        img_small = img
+
+    ocr_text = ""
     try:
-        text = _run_ocr(img)
-        visible = _trim_ocr(text, int(args.get("max_chars", 1500))) or "(no readable text)"
-    except ToolError as e:
-        return {
-            "result": f"Active window: {title or 'unknown'}. OCR unavailable: {e.message}",
-            "active_window": title,
-        }
-    return {
-        "result": f"Active window '{title or 'unknown'}' contains readable text.",
-        "active_window": title,
-        "text": visible,
+        ocr_text = _run_ocr(img)
+    except Exception:
+        pass
+
+    ui_text = _extract_window_text(hwnd)
+    windows = _get_visible_windows()
+    
+    res: Dict[str, Any] = {
+        "result": f"Screen and active window '{title or 'Desktop'}' analyzed successfully.",
+        "active_window": title or "Desktop",
+        "visible_windows": windows,
+        "image_base64": _image_to_b64(img_small, fmt="JPEG", quality=75),
+        "image_mime": "image/jpeg"
     }
+    if ui_text:
+        res["active_window_elements"] = ui_text
+    if ocr_text and "[OCR Error" not in ocr_text:
+        res["ocr_text"] = _trim_ocr(ocr_text, int(args.get("max_chars", 1500)))
+    return res
 
 
 __all__ = [
@@ -178,3 +247,4 @@ __all__ = [
     "analyze_screenshot",
     "read_screen",
 ]
+

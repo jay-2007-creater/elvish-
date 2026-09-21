@@ -10,3 +10,7 @@ WhatsApp*
 memories.json
 settings.json
 secrets.json
+reminders.json
+release/
+*.zip
+*.exe

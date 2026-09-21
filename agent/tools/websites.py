@@ -8,6 +8,9 @@ browser and the in-app holographic BrowserAgent).
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import webbrowser
 from typing import Any, Dict
 from urllib.parse import quote
@@ -27,7 +30,7 @@ SITE_URLS: Dict[str, str] = {
     "twitter": "https://twitter.com",
     "x": "https://x.com",
     "instagram": "https://www.instagram.com",
-    "facebook": "https://www.facebook.com",
+    "facebook": "https://facebook.com",
     "linkedin": "https://www.linkedin.com",
     "maps": "https://maps.google.com",
     "translate": "https://translate.google.com",
@@ -55,7 +58,17 @@ def _normalize_url(raw: str) -> str:
 def open_url(url: str) -> str:
     """Open a URL in the default browser; returns the resolved URL."""
     url = _normalize_url(url)
-    ok = webbrowser.open(url, new=2)  # new tab in a new window group if possible
+    if sys.platform == "win32":
+        try:
+            os.startfile(url)
+            return url
+        except Exception:
+            try:
+                subprocess.Popen(["cmd.exe", "/c", "start", "", url], shell=False)
+                return url
+            except Exception:
+                pass
+    ok = webbrowser.open(url, new=2)
     if not ok:
         raise ToolError(f"Failed to open default browser for {url}.")
     return url

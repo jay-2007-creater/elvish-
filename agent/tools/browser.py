@@ -4,7 +4,7 @@ Browser automation via Playwright.
 Modes:
   - managed (default): launches its own headed Chromium instance
   - cdp: connects to an existing Chrome via --remote-debugging-port=9222
-         (set ELYSIA_BROWSER_MODE=cdp to enable)
+         (set AKARI_BROWSER_MODE=cdp to enable)
 
 Capabilities: open/navigate, new/close tabs, search, click, type, fill forms,
 back/forward, scroll. Lazy-initialized; robust to closed pages.
@@ -62,8 +62,8 @@ def _run(coro):
 
 
 def _browser_mode() -> str:
-    """Return 'cdp' or 'managed' based on ELYSIA_BROWSER_MODE env var."""
-    return os.environ.get("ELYSIA_BROWSER_MODE", "managed").strip().lower()
+    """Return 'cdp' or 'managed' based on AKARI_BROWSER_MODE env var."""
+    return os.environ.get("AKARI_BROWSER_MODE", "managed").strip().lower()
 
 
 async def _ensure_browser_cdp_async() -> Any:
@@ -87,10 +87,10 @@ async def _ensure_browser_cdp_async() -> Any:
         from playwright.async_api import async_playwright
         STATE.playwright = await async_playwright().start()
 
-    cdp_url = os.environ.get("ELYSIA_CDP_URL", "http://127.0.0.1:9222")
+    cdp_url = os.environ.get("AKARI_CDP_URL", "http://127.0.0.1:9222")
     if getattr(STATE, "browser", None) is None:
         import logging
-        log = logging.getLogger("elysia.desktop")
+        log = logging.getLogger("akari.desktop")
         try:
             STATE.browser = await STATE.playwright.chromium.connect_over_cdp(cdp_url)
         except Exception as e:
@@ -112,7 +112,7 @@ async def _ensure_browser_cdp_async() -> Any:
                 import subprocess as _sp
                 # Use a temp user-data-dir so Chrome launches a fresh instance
                 # (otherwise an already-running Chrome reuses its own profile and ignores the debug port)
-                _tmpdir = os.path.join(_tempfile.gettempdir(), f"elysia-cdp-{_uuid.uuid4().hex[:8]}")
+                _tmpdir = os.path.join(_tempfile.gettempdir(), f"akari-cdp-{_uuid.uuid4().hex[:8]}")
                 _sp.Popen(
                     [chrome_exe, f"--user-data-dir={_tmpdir}", "--remote-debugging-port=9222", "--no-first-run"],
                     close_fds=True if _sys.platform != "win32" else False,
@@ -170,7 +170,7 @@ async def _ensure_browser_managed_async() -> Any:
         STATE.playwright = await async_playwright().start()
 
     if getattr(STATE, "context", None) is None:
-        user_data_dir = os.path.join(os.path.expanduser("~"), ".elysia_browser_data")
+        user_data_dir = os.path.join(os.path.expanduser("~"), ".akari_browser_data")
         import shutil as _shutil
         _chrome_channel = "chrome" if _shutil.which("google-chrome-stable") else None
         STATE.context = await STATE.playwright.chromium.launch_persistent_context(
@@ -336,39 +336,18 @@ async def browser_search(args: Dict[str, Any]) -> Dict[str, Any]:
 
 @register("desktopBrowserOpenYoutubeVideo")
 async def browser_open_youtube_video(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Open the first YouTube search result directly by following its canonical href."""
-    query = args.get("query") or args.get("q")
-    if not query:
-        raise ToolError("Parameter 'query' is required.")
-
-    page = await _page()
-    search_url = "https://www.youtube.com/results?search_query=" + quote_plus(str(query))
-
+    """Open a YouTube search result directly by following its canonical watch URL."""
     try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_selector("ytd-video-renderer", timeout=10000)
-
-        first_video = page.locator("ytd-video-renderer").first
-        link = first_video.locator("a#video-title").first
-        await link.wait_for(state="visible", timeout=5000)
-
-        href = await link.get_attribute("href")
-        if not href:
-            raise ToolError("Could not find a video URL in the first YouTube result.")
-
-        if href.startswith("/"):
-            href = "https://www.youtube.com" + href
-
-        await page.goto(href, wait_until="domcontentloaded", timeout=20000)
-        if "/watch" not in page.url:
-            raise ToolError(f"Expected YouTube watch page, got {page.url}")
-
-        return {
-            "result": f"Opened first YouTube video for '{query}'.",
-            "url": page.url,
-        }
-    except Exception as e:  # noqa: BLE001
-        raise ToolError(f"Could not open YouTube video: {e}")
+        from .youtube import play_youtube_video
+        return play_youtube_video(args)
+    except Exception as e:
+        query = args.get("query") or args.get("q")
+        if not query:
+            raise ToolError("Parameter 'query' is required.")
+        search_url = f"https://www.youtube.com/results?search_query={quote_plus(str(query))}"
+        import webbrowser
+        webbrowser.open(search_url)
+        return {"result": f"Opened YouTube search for '{query}'.", "url": search_url}
 
 
 @register("desktopBrowserClick")
@@ -582,7 +561,7 @@ async def browser_set_mode(args: Dict[str, Any]) -> Dict[str, Any]:
     mode = (args.get("mode") or "cdp").strip().lower()
     if mode not in ["cdp", "managed"]:
         raise ToolError("Invalid mode. Use 'cdp' or 'managed'.")
-    os.environ["ELYSIA_BROWSER_MODE"] = mode
+    os.environ["AKARI_BROWSER_MODE"] = mode
 
     if STATE.browser:
         try:

@@ -1,17 +1,17 @@
 """
-Elysia Desktop Control Agent — frozen entrypoint.
+Akari Desktop Control Agent — frozen entrypoint.
 
-This is the script PyInstaller freezes into `Elysia-agent.exe`. It runs the
+This is the script PyInstaller freezes into `Akari-agent.exe`. It runs the
 FastAPI agent with uvicorn using the app *object* (not an import string), which
 is the reliable way to launch inside a PyInstaller bundle. Logs are written to
 the per-user data directory so failures are never silent, even with no console.
 
-Run (frozen):   Elysia-agent.exe
+Run (frozen):   Akari-agent.exe
 Run (dev):      python run_agent.py
 Environment:
-    Elysia_AGENT_HOST   default 127.0.0.1
-    Elysia_AGENT_PORT   default 8765
-    Elysia_DATA_DIR     where logs/ is written (default: cwd)
+    Akari_AGENT_HOST   default 127.0.0.1
+    Akari_AGENT_PORT   default 8765
+    Akari_DATA_DIR     where logs/ is written (default: cwd)
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 def _resolve_data_dir() -> Path:
-    data = os.environ.get("Elysia_DATA_DIR") or os.getcwd()
+    data = os.environ.get("Akari_DATA_DIR") or os.getcwd()
     logs = Path(data) / "logs"
     try:
         logs.mkdir(parents=True, exist_ok=True)
@@ -51,9 +51,20 @@ def _configure_logging(data_dir: Path) -> None:
 
 
 def main() -> None:
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     data_dir = _resolve_data_dir()
     _configure_logging(data_dir)
-    log = logging.getLogger("Elysia.agent.boot")
+    log = logging.getLogger("Akari.agent.boot")
 
     try:
         from dotenv import load_dotenv
@@ -61,10 +72,10 @@ def main() -> None:
     except Exception:
         pass
 
-    host = os.environ.get("Elysia_AGENT_HOST", "127.0.0.1")
-    port = int(os.environ.get("Elysia_AGENT_PORT", "8765"))
+    host = os.environ.get("Akari_AGENT_HOST", "127.0.0.1")
+    port = int(os.environ.get("Akari_AGENT_PORT", "8765"))
     frozen = getattr(sys, "frozen", False)
-    log.info("Starting Elysia agent (frozen=%s) on %s:%d", frozen, host, port)
+    log.info("Starting Akari agent (frozen=%s) on %s:%d", frozen, host, port)
 
     try:
         from agent.server import app

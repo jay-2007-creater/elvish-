@@ -138,19 +138,79 @@ class WindowsClipboardManager(ClipboardManager):
 
 
 class WindowsScreenshotManager(ScreenshotManager):
+    def _gdi_capture(self, x: int = 0, y: int = 0, w: int = 0, h: int = 0) -> Any:
+        import ctypes
+        from ctypes import wintypes
+        from PIL import Image
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        if w <= 0:
+            w = user32.GetSystemMetrics(0)
+        if h <= 0:
+            h = user32.GetSystemMetrics(1)
+
+        hdc_screen = user32.GetDC(0)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        gdi32.SelectObject(hdc_mem, hbmp)
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD),
+                ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG),
+                ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG),
+                ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = w
+        bmi.biHeight = -h
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
+
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
+
+        return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1)
+
     def capture(self) -> Any:
         try:
-            from PIL import ImageGrab
-            return ImageGrab.grab(all_screens=True)
+            return self._gdi_capture()
         except Exception:
-            raise Exception("Screen capture failed")
+            try:
+                from PIL import ImageGrab
+                return ImageGrab.grab()
+            except Exception as e:
+                raise Exception(f"Screen capture failed: {e}")
 
     def capture_region(self, bbox: Tuple[int, int, int, int]) -> Any:
         try:
-            from PIL import ImageGrab
-            return ImageGrab.grab(bbox=bbox, all_screens=False)
+            x1, y1, x2, y2 = bbox
+            w = max(1, x2 - x1)
+            h = max(1, y2 - y1)
+            return self._gdi_capture(x1, y1, w, h)
         except Exception:
-            raise Exception("Region capture failed")
+            try:
+                from PIL import ImageGrab
+                return ImageGrab.grab(bbox=bbox)
+            except Exception as e:
+                raise Exception(f"Region capture failed: {e}")
 
     def active_window_bbox(self) -> Optional[Tuple[int, int, int, int]]:
         try:
@@ -164,19 +224,31 @@ class WindowsScreenshotManager(ScreenshotManager):
 
 class WindowsApplicationLauncher(ApplicationLauncher):
     def launch(self, spec: Dict[str, str]) -> None:
-        if "exe" in spec:
-            exe = spec["exe"]
-            if shutil.which(exe) or exe.lower().endswith(".exe"):
-                subprocess.Popen(
-                    [exe], shell=False, close_fds=True,
-                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                )
-            else:
-                subprocess.Popen(f'start "" "{exe}"', shell=True, close_fds=True)
-        elif "shell" in spec:
-            subprocess.Popen(f'start "" {spec["shell"]}', shell=True, close_fds=True)
+        if "path" in spec:
+            target = spec["path"]
+            try:
+                os.startfile(target)
+                return
+            except Exception:
+                subprocess.Popen(["cmd.exe", "/c", "start", "", target], shell=False)
         elif "uwp" in spec:
-            subprocess.Popen(f'start "" {spec["uwp"]}', shell=True, close_fds=True)
+            uwp_uri = spec["uwp"]
+            try:
+                os.startfile(uwp_uri)
+                return
+            except Exception:
+                subprocess.Popen(["cmd.exe", "/c", "start", "", uwp_uri], shell=False)
+        elif "exe" in spec:
+            exe = spec["exe"]
+            try:
+                os.startfile(exe)
+                return
+            except Exception:
+                pass
+            subprocess.Popen(["cmd.exe", "/c", "start", "", exe], shell=False)
+        elif "shell" in spec:
+            shell_cmd = spec["shell"]
+            subprocess.Popen(["cmd.exe", "/c", "start", "", shell_cmd], shell=False)
 
     def close(self, spec: Dict[str, str], force: bool) -> None:
         image = spec["image"]

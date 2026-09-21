@@ -1,10 +1,10 @@
-# ELYSIA — AI Voice Assistant with Holographic Interface
+# AKARI — AI Voice Assistant with Holographic Interface
 
 <div align="center">
-  <video src="https://github.com/SarangRao20/Elysia-AI/raw/main/demo.mp4" controls="controls" muted="muted" autoplay="autoplay" width="100%"></video>
+  <video src="https://github.com/SarangRao20/Akari-AI/raw/main/demo.mp4" controls="controls" muted="muted" autoplay="autoplay" width="100%"></video>
 </div>
 
-A real-time, voice-to-voice holographic AI companion desktop assistant built on the **Google Gemini Live API**. ELYSIA combines a holographic video character, persistent memory, a reminder system, a full desktop automation agent, and an in-app browser — all running locally with a 3-process architecture.
+A real-time, voice-to-voice holographic AI companion desktop assistant built on the **Google Gemini Live API**. AKARI combines a holographic video character, persistent memory, a reminder system, a full desktop automation agent, and an in-app browser — all running locally with a 3-process architecture.
 
 ---
 
@@ -34,11 +34,11 @@ A real-time, voice-to-voice holographic AI companion desktop assistant built on 
 
 | Architecture diagram | Anime‑girl frame |
 |----------------------|-----------------|
-| <img src="assets/chatgpt.png" alt="ELYSIA‑AI architecture" width="460"> | <img src="assets/frame.jpg" alt="Anime girl frame" width="460"> |
+| <img src="assets/chatgpt.png" alt="AKARI‑AI architecture" width="460"> | <img src="assets/frame.jpg" alt="Anime girl frame" width="460"> |
 
 </div>
 
-ELYSIA runs as **3 separate processes** that communicate over HTTP/WebSocket:
+AKARI runs as **3 separate processes** that communicate over HTTP/WebSocket:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -77,7 +77,7 @@ ELYSIA runs as **3 separate processes** that communicate over HTTP/WebSocket:
 - **Vite** (build tool + dev server)
 - Google Fonts: Space Grotesk, Inter, JetBrains Mono
 - Canvas API — custom holographic visualizer with particle rings, plasma core, emotion glow
-- Web Speech API — wake word detection ("Hey Elysia")
+- Web Speech API — wake word detection ("Hey Akari")
 - Web Audio API — PCM audio encoding/decoding for Gemini Live (16-bit, 16kHz)
 - `getDisplayMedia` — screen sharing to Gemini
 
@@ -113,14 +113,14 @@ The Python agent has a backend abstraction layer for cross-platform support:
 ## Project Structure
 
 ```
-elysia-ai-assistant/
+akari-ai-assistant/
 ├── server.ts                  # Main Node.js server (Express + WebSocket + Gemini Live)
 ├── server_memory.ts           # Memory CRUD API (REST endpoints)
 ├── server_reminders.ts        # Reminder system (timer-based with notification injection)
 ├── server_paths.ts            # Data directory path resolution
 ├── local-agent.js             # Standalone Playwright server (port 3001)
 ├── run_agent.py               # PyInstaller entry point for standalone agent
-├── start_elysia.sh             # Launch script (Python agent + Node server)
+├── start_akari.sh             # Launch script (Python agent + Node server)
 │
 ├── package.json
 ├── tsconfig.json
@@ -148,11 +148,11 @@ elysia-ai-assistant/
 │   │   ├── memoryTypes.ts     # Memory TypeScript interfaces
 │   │   ├── reminderTypes.ts   # Reminder TypeScript interfaces
 │   │   ├── settingsStore.ts   # Settings persistence (localStorage + server)
-│   │   └── wakeWord.ts        # "Hey Elysia" wake word detection via Web Speech API
+│   │   └── wakeWord.ts        # "Hey Akari" wake word detection via Web Speech API
 │   │
 │   └── components/
 │       ├── ApiKeyGate.tsx          # First-run API key onboarding overlay
-│       ├── ElysiaCoreVisualizer.tsx # Canvas-based holographic visualizer + video character
+│       ├── AkariCoreVisualizer.tsx # Canvas-based holographic visualizer + video character
 │       ├── BrowserAgent.tsx        # In-app browser with tabs, address bar, Playwright backend
 │       ├── MemoryDashboard.tsx     # Memory CRUD with category filtering
 │       ├── SettingsPanel.tsx       # General, Voice, System, About settings tabs
@@ -212,7 +212,7 @@ elysia-ai-assistant/
 5. After each conversation turn, Gemini analyzes recent messages and extracts **memory transactions** (add/update/delete facts about the user)
 
 ### Wake Word Detection
-- Uses the Web Speech API to listen for "Hey Elysia"
+- Uses the Web Speech API to listen for "Hey Akari"
 - When detected, the visualizer transitions to listening state and captures speech
 
 ### Function Calling
@@ -236,7 +236,7 @@ elysia-ai-assistant/
 
 ## Database / Persistence
 
-ELYSIA uses **no traditional database**. All data is stored as JSON files in the data directory (`~/.elysia/` by default, configurable via `ELYSIA_DATA_DIR`):
+AKARI uses **no traditional database**. All data is stored as JSON files in the data directory (`~/.akari/` by default, configurable via `AKARI_DATA_DIR`):
 
 | File | Purpose |
 |---|---|
@@ -262,7 +262,7 @@ After each conversation turn, Gemini analyzes a slice of recent messages and pro
 ### Reminder System
 - Timer-based using `setInterval` with configurable delay and optional repeat
 - Fires browser toast notifications with countdown
-- Injects a callback into the active Gemini session so ELYSIA can remind you verbally
+- Injects a callback into the active Gemini session so AKARI can remind you verbally
 
 ---
 
@@ -272,11 +272,11 @@ After each conversation turn, Gemini analyzes a slice of recent messages and pro
 - Real-time bidirectional audio streaming via WebSocket
 - 16-bit PCM audio at 16kHz sample rate
 - Configurable voice (7 options): Aoede, Charon, Fenrir, Kore, Leda, Puck, Zephyr
-- System prompt establishes ELYSIA's personality and context
+- System prompt establishes AKARI's personality and context
 
 ### Function Calling (Server-Side Tools)
 
-ELYSIA registers **~113 function declarations** with Gemini, spanning:
+AKARI registers **~113 function declarations** with Gemini, spanning:
 
 | Category | Example Tools |
 |---|---|
@@ -311,7 +311,7 @@ The Python desktop agent runs on port 8765 and provides **91 tools** across 22 m
 | `iitm` | `iitmQuickLinks`, `iitmOpen`, `iitmOpenCustom` | IITM BS Degree portal shortcuts |
 | `news` | `getNews` | Fetch top headlines across 6 categories via Google News RSS |
 | `os_input` | `osType`, `osPress`, `osClick` | OS-level keyboard and mouse simulation |
-| `pc` | `volumeUp/Down`, `setVolume`, `brightnessUp/Down`, `setBrightness`, `muteToggle`, `executePowerAction`, `shutdownElysia` | System hardware controls |
+| `pc` | `volumeUp/Down`, `setVolume`, `brightnessUp/Down`, `setBrightness`, `muteToggle`, `executePowerAction`, `shutdownAkari` | System hardware controls |
 | `screenshot` | `takeScreenshot`, `saveScreenshot`, `analyzeScreenshot`, `readScreen` | Screenshot capture + Tesseract OCR |
 | `search` | `searchWeb`, `searchYouTube`, `searchGoogle`, `searchGitHub` | Web search shortcuts |
 | `startup` | `enableAutoStart`, `disableAutoStart`, `getAutoStartStatus` | Auto-start on login (Windows registry) |
@@ -358,7 +358,7 @@ Switch at runtime with `desktopBrowserSetMode(mode: "cdp" | "managed")`.
 
 | Component | Description |
 |---|---|
-| `ElysiaCoreVisualizer` | Canvas-based holographic visualizer with particle rings, plasma core, emotion glow, mouse tracking. Renders the video character in idle/thinking/talking states. |
+| `AkariCoreVisualizer` | Canvas-based holographic visualizer with particle rings, plasma core, emotion glow, mouse tracking. Renders the video character in idle/thinking/talking states. |
 | `BrowserAgent` | Full in-app browser with tabs, address bar, search, powered by the Python Playwright backend |
 | `MemoryDashboard` | Memory management UI with category filtering, CRUD operations |
 | `SettingsPanel` | 4-tab settings: General, Voice, System, About. Voice selection, wake word config, theme picker, volume controls. |
@@ -372,7 +372,7 @@ Switch at runtime with `desktopBrowserSetMode(mode: "cdp" | "managed")`.
 ### Audio Pipeline
 - **Encoding**: `Float32Array` → `Int16Array` PCM at 16kHz
 - **Decoding**: Gemini response PCM → `AudioBuffer` → Web Audio API playback
-- **Wake Word**: Web Speech API continuous recognition, triggers on "Hey Elysia" detection
+- **Wake Word**: Web Speech API continuous recognition, triggers on "Hey Akari" detection
 
 ---
 
@@ -414,7 +414,7 @@ Keys stored in `secrets.json` in the data directory; only the backend reads them
 | Setting | Options | Default |
 |---|---|---|
 | `voice` | Aoede, Charon, Fenrir, Kore, Leda, Puck, Zephyr | Kore |
-| `wakeWord` | "Hey Elysia", custom string, or disabled | "Hey Elysia" |
+| `wakeWord` | "Hey Akari", custom string, or disabled | "Hey Akari" |
 | `sensitivity` | 0.1 - 1.0 | 0.5 |
 | `theme` | Violet, Crimson, Emerald, Celestial, Gold, Rose, Charcoal | Violet |
 | `userVolume` | 0 - 100 | 70 |
@@ -458,7 +458,7 @@ cp .env.local .env
 # Then edit .env with your GEMINI_API_KEY
 
 # Start everything (Python agent + Node server)
-bash start_elysia.sh
+bash start_akari.sh
 ```
 
 Or manually:
@@ -480,7 +480,7 @@ npm run start    # Starts Python agent + Node.js production server
 
 | Script | Description |
 |---|---|
-| `bash start_elysia.sh` | Launches both Python agent + Node.js server |
+| `bash start_akari.sh` | Launches both Python agent + Node.js server |
 | `npm run dev` | Starts Node.js server with Vite middleware (HMR disabled via `.env`) |
 | `npm run build` | `vite build` + `esbuild` bundles server to `dist/server.cjs` |
 | `npm run start` | Production: starts Python agent + Node.js production server |
@@ -492,11 +492,11 @@ npm run start    # Starts Python agent + Node.js production server
 | Variable | Description | Default |
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `GOOGLE_GENAI_API_KEY` | Gemini API authentication | — |
-| `ELYSIA_BROWSER_MODE` | Browser automation mode: `managed` or `cdp` | `managed` |
-| `ELYSIA_CDP_URL` | CDP WebSocket URL (only used in CDP mode) | `http://127.0.0.1:9222` |
-| `ELYSIA_DATA_DIR` | Custom data directory path | `~/.elysia/` |
-| `ELYSIA_AGENT_HOST` | Desktop agent host | `127.0.0.1` |
-| `ELYSIA_AGENT_PORT` | Desktop agent port | `8765` |
+| `AKARI_BROWSER_MODE` | Browser automation mode: `managed` or `cdp` | `managed` |
+| `AKARI_CDP_URL` | CDP WebSocket URL (only used in CDP mode) | `http://127.0.0.1:9222` |
+| `AKARI_DATA_DIR` | Custom data directory path | `~/.akari/` |
+| `AKARI_AGENT_HOST` | Desktop agent host | `127.0.0.1` |
+| `AKARI_AGENT_PORT` | Desktop agent port | `8765` |
 | `DISABLE_HMR` | Toggle Vite HMR/file-watching off | `false` |
 
 Copy `.env.local` to `.env` and fill in your API key:
@@ -532,7 +532,7 @@ Designed and developed by **Sarang (SarangRao20)** — an independent developer 
 - Cross-platform desktop agent with 91 tools across 22 modules
 - Dual browser automation (CDP + managed modes)
 - In-app Playwright browser with media controls
-- Wake word detection ("Hey Elysia")
+- Wake word detection ("Hey Akari")
 - Screen sharing to Gemini
 - Toast notification system
 - Two-step confirmation dialogs for dangerous actions (terminal + power)

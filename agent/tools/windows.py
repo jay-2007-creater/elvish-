@@ -15,6 +15,16 @@ SW_MAXIMIZE = 3
 SW_RESTORE = 9
 SW_HIDE = 0
 
+PROTECTED_TITLES = (
+    "akari", "akari", "localhost:3000", "127.0.0.1:3000",
+    "localhost:5173", "127.0.0.1:5173", "vite", "react",
+    "akari-ai", "akari-ai", "jr. sidd", "jr sidd"
+)
+
+def _is_protected(title: str) -> bool:
+    t = (title or "").lower().strip()
+    return any(p in t for p in PROTECTED_TITLES)
+
 def _resolve_target(args: Dict[str, Any]):
     """Pick the hwnd to operate on: explicit title, or the foreground window."""
     wm = get_backend().window_manager
@@ -33,6 +43,8 @@ def _resolve_target(args: Dict[str, Any]):
 @register("minimizeWindow")
 def minimize_window(args: Dict[str, Any]) -> Dict[str, Any]:
     hwnd, title = _resolve_target(args)
+    if _is_protected(title):
+        return {"result": f"Akari AI window ('{title}') is protected and will not be minimized."}
     get_backend().window_manager.show_window(hwnd, SW_MINIMIZE)
     return {"result": f"Minimized window: {title or 'active window'}."}
 
@@ -47,6 +59,8 @@ def maximize_window(args: Dict[str, Any]) -> Dict[str, Any]:
 @register("closeWindow")
 def close_window(args: Dict[str, Any]) -> Dict[str, Any]:
     hwnd, title = _resolve_target(args)
+    if _is_protected(title):
+        return {"result": f"Akari AI window ('{title}') is protected and will not be closed."}
     get_backend().window_manager.close_window(hwnd)
     return {"result": f"Closed window: {title or 'active window'}."}
 

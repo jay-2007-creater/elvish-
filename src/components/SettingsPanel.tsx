@@ -9,23 +9,39 @@ import {
   Check,
   AlertTriangle,
   Sparkles,
+  Key,
+  CheckCircle2,
+  Radio,
+  UserCheck,
+  Fingerprint,
+  AudioLines,
+  RefreshCw,
+  Zap,
+  Layers,
+  Send,
+  Globe,
+  Database,
+  Terminal,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { getVTubeStudioClient, type VTSStatus } from "../lib/vtsClient";
 import {
-  ElysiaSettings,
+  AkariSettings,
   GEMINI_VOICES,
+  PERSONA_PRESETS,
 } from "../lib/settingsStore";
+import { globalVoiceBiometrics } from "../lib/voiceBiometrics";
 
 interface SettingsPanelProps {
   isOpen: boolean;
   onClose: () => void;
-  settings: ElysiaSettings;
-  onChange: (patch: Partial<ElysiaSettings>) => void;
-  themeColor: string;
+  settings: AkariSettings;
+  onChange: (patch: Partial<AkariSettings>) => void;
+  themeColor?: string;
   onVoiceChange?: (voice: string) => void;
 }
 
-type SettingsTab = "general" | "voice" | "system" | "about";
+type SettingsTab = "general" | "persona" | "voice" | "offline" | "livestream" | "system" | "about";
 
 function ToggleRow({ 
   label, 
@@ -70,10 +86,209 @@ function ToggleRow({
 export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChange }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+  const [hasApiKey, setHasApiKey] = useState<boolean>(false);
+  const [apiKeyInput, setApiKeyInput] = useState<string>("");
+  const [apiKeyStatus, setApiKeyStatus] = useState<string>("");
+  const [isSavingKey, setIsSavingKey] = useState<boolean>(false);
+  const [vtsStatus, setVtsStatus] = useState<VTSStatus>({ connected: false, authenticated: false });
   const [agentHealth, setAgentHealth] = useState<{
     online: boolean;
     toolCount?: number;
   }>({ online: false });
+
+  // Voice Calibration & Background Training state
+  const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
+  const [calibrationStep, setCalibrationStep] = useState<number>(0);
+  const [calibrationSuccess, setCalibrationSuccess] = useState<boolean>(false);
+  const [bioProfile, setBioProfile] = useState(() => globalVoiceBiometrics.getProfile());
+
+  // Ollama Offline Brain state
+  const [ollamaStatus, setOllamaStatus] = useState<{
+    online: boolean;
+    models: Array<{ name: string; size?: number }>;
+    checking: boolean;
+    error?: string;
+  }>({ online: false, models: [], checking: false });
+
+  const [testPrompt, setTestPrompt] = useState<string>("Hello Akari, introduce yourself!");
+  const [testOutput, setTestOutput] = useState<string>("");
+  const [isTestingOllama, setIsTestingOllama] = useState<boolean>(false);
+  const [testLatency, setTestLatency] = useState<number | null>(null);
+
+  const checkOllama = async () => {
+    setOllamaStatus((prev) => ({ ...prev, checking: true, error: undefined }));
+    const endpoint = (settings.ollamaEndpoint || "http://localhost:11434").replace(/\/+$/, "");
+    
+    // 1. Try direct browser connection to Ollama
+    try {
+      const directRes = await fetch(`${endpoint}/api/tags`, { method: "GET" });
+      if (directRes.ok) {
+        const data = await directRes.json();
+        setOllamaStatus({
+          online: true,
+          models: data.models || [],
+          checking: false,
+        });
+        return;
+      }
+    } catch {
+      // Direct connection blocked by CORS or mixed content - fallback to backend proxy
+    }
+
+    // 2. Try backend proxy
+    try {
+      const proxyRes = await fetch(`/api/ollama/status?endpoint=${encodeURIComponent(endpoint)}`);
+      const contentType = proxyRes.headers.get("content-type") || "";
+      if (proxyRes.ok && contentType.includes("application/json")) {
+        const data = await proxyRes.json();
+        if (data.online) {
+          setOllamaStatus({
+            online: true,
+            models: data.models || [],
+            checking: false,
+          });
+          return;
+        }
+      }
+    } catch {}
+
+    setOllamaStatus({
+      online: false,
+      models: [],
+      checking: false,
+      error: "Ollama server unreachable. Restart server or run 'ollama serve'.",
+    });
+  };
+
+  const handleTestOllamaInference = async () => {
+    if (!testPrompt.trim() || isTestingOllama) return;
+    setIsTestingOllama(true);
+    setTestOutput("");
+    const startTime = performance.now();
+    const endpoint = (settings.ollamaEndpoint || "http://localhost:11434").replace(/\/+$/, "");
+    const model = settings.ollamaModel || "llama3.2";
+
+    // 1. Try direct fetch to Ollama
+    try {
+      const directRes = await fetch(`${endpoint}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: model,
+          prompt: testPrompt,
+          system: "You are Akari, a smart, cute, and helpful AI companion. Keep answers lively, concise, and friendly.",
+          stream: false,
+        }),
+      });
+      if (directRes.ok) {
+        const data = await directRes.json();
+        const elapsed = Math.round(performance.now() - startTime);
+        setTestLatency(elapsed);
+        setTestOutput(data.response || data.text || "No response received.");
+        setIsTestingOllama(false);
+        return;
+      }
+    } catch {}
+
+    // 2. Try proxy endpoint
+    try {
+      const res = await fetch("/api/ollama/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: testPrompt,
+          model: model,
+          endpoint: endpoint,
+        }),
+      });
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("application/json")) {
+        const data = await res.json();
+        const elapsed = Math.round(performance.now() - startTime);
+        setTestLatency(elapsed);
+        if (data.ok) {
+          setTestOutput(data.text);
+        } else {
+          setTestOutput(`Error: ${data.error || "Failed to generate response"}`);
+        }
+      } else {
+        setTestOutput("Please restart your Akari server with .\\start_akari.bat to load backend routes.");
+      }
+    } catch (err: any) {
+      setTestOutput(`Network Error: ${err.message}`);
+    } finally {
+      setIsTestingOllama(false);
+    }
+  };
+
+  const startVoiceCalibration = async () => {
+    setIsCalibrating(true);
+    setCalibrationStep(1);
+    setCalibrationSuccess(false);
+    globalVoiceBiometrics.startCalibration();
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setTimeout(() => setCalibrationStep(2), 1200);
+      setTimeout(() => setCalibrationStep(3), 2400);
+      setTimeout(() => {
+        const updated = globalVoiceBiometrics.finishCalibration();
+        setBioProfile({ ...updated });
+        setCalibrationSuccess(true);
+        setIsCalibrating(false);
+        onChange({ voiceProfileEnrolled: true });
+        stream.getTracks().forEach(t => t.stop());
+      }, 3600);
+    } catch (e) {
+      console.error("Calibration mic access error:", e);
+      setIsCalibrating(false);
+      setCalibrationStep(0);
+    }
+  };
+
+  const handleResetVoiceTraining = () => {
+    const fresh = globalVoiceBiometrics.resetTrainingProfile();
+    setBioProfile({ ...fresh });
+    onChange({ voiceProfileEnrolled: false });
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setBioProfile(globalVoiceBiometrics.getProfile());
+    globalVoiceBiometrics.setBackgroundLearning(settings.backgroundVoiceTraining !== false);
+    const vts = getVTubeStudioClient((s) => setVtsStatus(s));
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((d) => setHasApiKey(Boolean(d.hasApiKey)))
+      .catch(() => {});
+    checkOllama();
+  }, [isOpen, settings.backgroundVoiceTraining]);
+
+  const handleSaveApiKey = async () => {
+    if (!apiKeyInput.trim()) return;
+    setIsSavingKey(true);
+    setApiKeyStatus("Validating & saving key...");
+    try {
+      const res = await fetch("/api/config/apikey", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey: apiKeyInput.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        setHasApiKey(true);
+        setApiKeyInput("");
+        setApiKeyStatus("API Key saved successfully! Reloading session...");
+        setTimeout(() => setApiKeyStatus(""), 4000);
+      } else {
+        setApiKeyStatus(`Error: ${data.error || "Failed to save key"}`);
+      }
+    } catch (err: any) {
+      setApiKeyStatus(`Error: ${err.message || "Failed to save key"}`);
+    } finally {
+      setIsSavingKey(false);
+    }
+  };
 
   useEffect(() => {
     if (!isOpen) return;
@@ -117,8 +332,11 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
 
   const tabs: { id: SettingsTab; label: string; icon: any }[] = [
     { id: "general", label: "Sys_Config", icon: Power },
-    { id: "voice", label: "Audio_I/O", icon: Mic },
-    { id: "system", label: "Daemon_Link", icon: Cpu },
+    { id: "persona", label: "Persona & Mind", icon: Sparkles },
+    { id: "voice", label: "Audio & TTS", icon: Mic },
+    { id: "offline", label: "Offline Brain", icon: Cpu },
+    { id: "livestream", label: "Live Stream", icon: Radio },
+    { id: "system", label: "Daemon_Link", icon: Layers },
     { id: "about", label: "Core_Stats", icon: Info },
   ];
 
@@ -159,7 +377,7 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                       SETTINGS
                     </h3>
                     <p className="text-[9px] font-mono uppercase tracking-widest text-cyan-400 mt-0.5 flex items-center gap-1">
-                      <Sparkles size={10} /> {settings.avatarStyle === "orb" ? "Aegis_Core" : "Elysia_Core"}
+                      <Sparkles size={10} /> {settings.avatarStyle === "jrsidd" ? "Jr_Sidd_Core" : settings.avatarStyle === "orb" ? "Aegis_Core" : "Akari_Core"}
                     </p>
                   </div>
                 </div>
@@ -181,69 +399,157 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                     >
                       <Icon size={16} className={isActive ? "text-cyan-400" : "text-cyan-800 group-hover:text-cyan-500"} />
                       <span className="relative z-10">{tab.label}</span>
-                      {tab.id === "system" && !agentHealth.online && (
-                        <span className="w-1.5 h-1.5 bg-rose-500 animate-pulse ml-auto shadow-[0_0_8px_rgba(244,63,94,0.8)]" />
+                      {tab.id === "offline" && settings.offlineBrainEnabled && (
+                        <span className="ml-auto w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                       )}
                     </button>
                   );
                 })}
               </div>
-              
-              <div className="p-4 border-t border-cyan-500/20 text-[9px] font-mono text-cyan-700 uppercase tracking-widest flex justify-between">
-                <span>AUTH: ADMIN</span>
-                <span>SEC: L4</span>
+
+              <div className="p-4 border-t border-cyan-500/20 bg-black/40 text-[10px] font-mono text-cyan-700 uppercase tracking-widest flex items-center justify-between">
+                <span>SYSTEM V2.5</span>
+                <span className="text-cyan-400">READY</span>
               </div>
             </div>
 
-            {/* Content Pane */}
-            <div className="flex-1 flex flex-col bg-black/60 relative">
-              <div className="absolute inset-0 bg-[linear-gradient(rgba(0,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(0,255,255,0.02)_1px,transparent_1px)] bg-[size:30px_30px] pointer-events-none opacity-50" />
-              
-              <div className="px-10 py-8 flex items-center justify-between border-b border-cyan-500/20 bg-black/40 relative z-10">
-                <div className="flex items-center gap-4">
-                  <div className="w-2 h-8 bg-cyan-500 shadow-[0_0_10px_rgba(6,182,212,0.6)]" />
-                  <h2 className="text-2xl font-mono tracking-widest text-white uppercase">
-                    {tabs.find(t => t.id === activeTab)?.label}
-                  </h2>
+            {/* Content Area */}
+            <div className="flex-1 flex flex-col bg-black/40 overflow-hidden relative">
+              <div className="flex justify-between items-center px-8 py-6 border-b border-cyan-500/20 bg-cyan-950/5">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-cyan-400 animate-ping" />
+                  <span className="text-xs font-mono tracking-widest text-cyan-400 uppercase">
+                    // CONTROL_PANEL :: {tabs.find((t) => t.id === activeTab)?.label}
+                  </span>
                 </div>
                 <button
                   onClick={onClose}
-                  className="p-2 bg-cyan-950/40 text-cyan-400 hover:bg-rose-900/40 hover:text-rose-400 transition-all cursor-pointer border border-cyan-500/30 hover:border-rose-500/50"
-                  style={{ clipPath: "polygon(0 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%)" }}
+                  className="text-cyan-600 hover:text-cyan-300 p-1 border border-transparent hover:border-cyan-500/30 transition-all cursor-pointer"
                 >
-                  <X size={20} />
+                  <X size={18} />
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-10 relative z-10 no-scrollbar">
-                <div className="max-w-2xl mx-auto space-y-12">
+              <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+                <div className="max-w-2xl mx-auto space-y-8">
                   
+                  {/* GENERAL TAB */}
                   {activeTab === "general" && (
                     <div className="space-y-8 animate-in fade-in duration-500">
-                      <div className="space-y-3">
-                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase flex items-center gap-2">
-                          <span className="w-1 h-1 bg-cyan-400 rounded-full animate-pulse" /> Environmental FX
-                        </label>
-                        <select
-                          value={settings.backgroundVideo}
-                          onChange={(e) => onChange({ backgroundVideo: e.target.value })}
-                          className="w-full px-4 py-3 bg-black/50 border border-cyan-500/20 text-sm font-mono text-cyan-50 focus:outline-none focus:border-cyan-400/80 transition cursor-pointer"
-                          style={{ clipPath: "polygon(0 0, calc(100% - 15px) 0, 100% 15px, 100% 100%, 0 100%)" }}
-                        >
-                          <option className="bg-slate-900 text-white" value="">Dynamic CSS Mesh (Default)</option>
-                          <option className="bg-slate-900 text-white" value="solid">Solid Theme Color</option>
-                          <option className="bg-slate-900 text-white" value="bg-6.mp4">Cinematic Scene (1)</option>
-                          <option className="bg-slate-900 text-white" value="bg-7.mp4">Cinematic Scene (2)</option>
-                        </select>
+                      
+                      {/* API Key Management Box */}
+                      <div className="p-5 bg-black/60 border border-cyan-500/30 rounded-none relative">
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                            <Key size={14} className="text-cyan-400" />
+                            Gemini Live API Key
+                          </label>
+                          <span className={`text-[10px] font-mono px-2 py-0.5 border ${
+                            hasApiKey
+                              ? "bg-emerald-950/40 text-emerald-400 border-emerald-500/40"
+                              : "bg-rose-950/40 text-rose-400 border-rose-500/40"
+                          }`}>
+                            {hasApiKey ? "STATUS: ACTIVE" : "STATUS: KEY REQUIRED"}
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-mono text-cyan-600/80 mb-3 leading-relaxed">
+                          Enter your Google AI Studio Gemini API Key. You can get one for free at{" "}
+                          <a
+                            href="https://aistudio.google.com/apikey"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-cyan-400 underline hover:text-cyan-300"
+                          >
+                            aistudio.google.com/apikey
+                          </a>.
+                        </p>
+                        <div className="flex gap-2">
+                          <input
+                            type="password"
+                            placeholder={hasApiKey ? "•••••••••••••••••••••••• (Key Configured)" : "Paste AIzaSy... API key here"}
+                            value={apiKeyInput}
+                            onChange={(e) => setApiKeyInput(e.target.value)}
+                            onKeyDown={(e) => e.key === "Enter" && handleSaveApiKey()}
+                            className="flex-1 bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSaveApiKey}
+                            disabled={isSavingKey || !apiKeyInput.trim()}
+                            className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400 text-cyan-300 font-mono text-xs uppercase tracking-wider transition disabled:opacity-40 cursor-pointer"
+                          >
+                            {isSavingKey ? "Saving..." : "Update Key"}
+                          </button>
+                        </div>
+                        {apiKeyStatus && (
+                          <div className="mt-2 text-[11px] font-mono text-cyan-300">
+                            {apiKeyStatus}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* DeepSeek AI PowerPoint Integration */}
+                      <div className="p-5 bg-black/60 border border-indigo-500/30 rounded-none relative">
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-xs font-mono tracking-widest text-indigo-400 uppercase flex items-center gap-2">
+                            <Sparkles size={14} className="text-indigo-400" />
+                            DeepSeek AI PowerPoint & Slide Architect
+                          </label>
+                          <span className={`text-[10px] font-mono px-2 py-0.5 border ${
+                            settings.deepseekApiKey
+                              ? "bg-indigo-950/40 text-indigo-400 border-indigo-500/40"
+                              : "bg-slate-900/60 text-slate-500 border-slate-700"
+                          }`}>
+                            {settings.deepseekApiKey ? "DEEPSEEK: CONNECTED" : "DEEPSEEK: OPTIONAL"}
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-mono text-indigo-300/80 mb-3 leading-relaxed">
+                          Empower Akari with DeepSeek's advanced reasoning model to generate presentation decks, design layouts, and execute deep slide edits.
+                        </p>
+
+                        <div className="space-y-3">
+                          <ToggleRow
+                            label="Enable DeepSeek AI PowerPoint Engine"
+                            description="Use DeepSeek models for presentation structure"
+                            checked={settings.enableDeepSeekPpt !== false}
+                            onChange={(v) => onChange({ enableDeepSeekPpt: v })}
+                          />
+
+                          <div>
+                            <label className="block text-[10px] font-mono tracking-widest text-indigo-400 uppercase mb-1">
+                              DeepSeek API Key
+                            </label>
+                            <input
+                              type="password"
+                              placeholder="sk-..."
+                              value={settings.deepseekApiKey || ""}
+                              onChange={(e) => onChange({ deepseekApiKey: e.target.value.trim() })}
+                              className="w-full bg-black/80 border border-indigo-500/30 text-indigo-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-indigo-400"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-mono tracking-widest text-indigo-400 uppercase mb-1">
+                              DeepSeek Model
+                            </label>
+                            <input
+                              type="text"
+                              placeholder="deepseek-chat"
+                              value={settings.deepseekModel || "deepseek-chat"}
+                              onChange={(e) => onChange({ deepseekModel: e.target.value.trim() })}
+                              className="w-full bg-black/80 border border-indigo-500/30 text-indigo-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-indigo-400"
+                            />
+                          </div>
+                        </div>
                       </div>
 
                       <div className="space-y-3">
                         <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase flex items-center gap-2">
-                          <span className="w-1 h-1 bg-cyan-400 rounded-full" /> System Hooks
+                          <span className="w-1 h-1 bg-cyan-400 rounded-full" /> Windows Auto-Start
                         </label>
                         <ToggleRow
-                          label="Auto-Launch Sequence"
-                          description="Boot agent automatically with OS"
+                          label="Silent Auto-Start on Login"
+                          description="Launch Akari silently in the background when Windows boots"
                           checked={settings.autoStart}
                           onChange={(v) => {
                             onChange({ autoStart: v });
@@ -258,8 +564,14 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
 
                       <div className="space-y-3">
                         <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase flex items-center gap-2">
-                          <span className="w-1 h-1 bg-cyan-400 rounded-full" /> UI Rendering
+                          <span className="w-1 h-1 bg-cyan-400 rounded-full" /> UI & Avatar Gaze
                         </label>
+                        <ToggleRow
+                          label="Interactive Mouse Gaze"
+                          description="Akari's eyes & head follow your mouse cursor"
+                          checked={settings.cursorTrackingEnabled !== false}
+                          onChange={(v) => onChange({ cursorTrackingEnabled: v })}
+                        />
                         <ToggleRow
                           label="Kinetic Animations"
                           description="Enable fluid UI and particle effects"
@@ -270,40 +582,219 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                     </div>
                   )}
 
-                  {activeTab === "voice" && (
-                    <div className="space-y-10 animate-in fade-in duration-500">
+                  
+                  {/* PERSONA & INNER MIND STUDIO TAB */}
+                  {activeTab === "persona" && (
+                    <div className="space-y-8 animate-in fade-in duration-500">
                       
-                      <div className="space-y-3">
-                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">Hologram Archetype</label>
-                        <div className="grid grid-cols-2 gap-4">
-                          {[
-                            { id: "character", label: "Anime Entity", voice: "Aoede", desc: "Video Assets" },
-                            { id: "orb", label: "Aegis Orb", voice: "Charon", desc: "Live API Mesh" }
-                          ].map((a) => (
-                            <button
-                              key={a.id}
-                              onClick={() => {
-                                onChange({ avatarStyle: a.id as any, voice: a.voice });
-                                if (settings.voice !== a.voice) onVoiceChange?.(a.voice);
-                              }}
-                              className={`p-4 border text-left transition-all duration-300 cursor-pointer ${
-                                settings.avatarStyle === a.id
-                                  ? "border-cyan-400 bg-cyan-500/10 shadow-[inset_0_0_20px_rgba(6,182,212,0.2)]"
-                                  : "border-cyan-900/40 bg-black/40 hover:border-cyan-500/40"
-                              }`}
-                              style={{ clipPath: "polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px)" }}
-                            >
-                              <div className={`text-sm font-mono uppercase tracking-wider ${settings.avatarStyle === a.id ? "text-cyan-300" : "text-cyan-700"}`}>
-                                {a.label}
-                              </div>
-                              <div className="text-[9px] font-mono text-cyan-600/60 mt-1 uppercase">MODE: {a.desc}</div>
-                            </button>
-                          ))}
+                      {/* Archetype Selector */}
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                            <Sparkles size={14} /> Personality Archetype Matrix
+                          </label>
+                          <span className="text-[10px] font-mono text-cyan-600 uppercase">
+                            CURRENT: {settings.personaPreset || "anime_companion"}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {PERSONA_PRESETS.map((preset) => {
+                            const isSelected = (settings.personaPreset || "anime_companion") === preset.id;
+                            return (
+                              <button
+                                key={preset.id}
+                                onClick={() => {
+                                  onChange({
+                                    personaPreset: preset.id,
+                                    customSystemPrompt: preset.systemPrompt || settings.customSystemPrompt,
+                                  });
+                                }}
+                                className={`p-4 text-left border transition-all duration-300 relative group flex items-start gap-3.5 cursor-pointer ${
+                                  isSelected
+                                    ? "bg-cyan-950/40 border-cyan-400 shadow-[0_0_20px_rgba(6,182,212,0.25)]"
+                                    : "bg-black/40 border-cyan-900/40 hover:border-cyan-500/50 hover:bg-cyan-950/20"
+                                }`}
+                              >
+                                <div className="text-2xl p-2 bg-black/60 border border-cyan-500/20 rounded-none shrink-0 group-hover:scale-110 transition-transform">
+                                  {preset.icon}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <h4 className={`text-xs font-mono uppercase tracking-wider font-semibold ${isSelected ? "text-cyan-300" : "text-white"}`}>
+                                      {preset.name}
+                                    </h4>
+                                    {isSelected && (
+                                      <span className="text-[9px] font-mono bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 border border-cyan-400/40 uppercase">
+                                        ACTIVE
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-[11px] font-mono text-cyan-600/80 mt-1 line-clamp-2 leading-relaxed">
+                                    {preset.tagline}
+                                  </p>
+                                </div>
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
 
+                      {/* Custom Persona & System Prompt Editor */}
+                      <div className="space-y-3 p-5 bg-black/60 border border-cyan-500/30 rounded-none relative">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                            <Terminal size={14} /> Persona Directives & System Prompt
+                          </label>
+                          <button
+                            onClick={() => {
+                              const currentPreset = PERSONA_PRESETS.find((p) => p.id === (settings.personaPreset || "anime_companion"));
+                              if (currentPreset?.systemPrompt) {
+                                onChange({ customSystemPrompt: currentPreset.systemPrompt });
+                              }
+                            }}
+                            className="text-[10px] font-mono text-cyan-400 hover:text-cyan-300 uppercase underline tracking-wider cursor-pointer"
+                          >
+                            Reset To Archetype Prompt
+                          </button>
+                        </div>
+                        <p className="text-[10px] font-mono text-cyan-600 uppercase tracking-wider">
+                          Injects custom behavioral rules, backstories, speech patterns, and world context directly into Akari's AI brain.
+                        </p>
+                        <textarea
+                          value={
+                            settings.customSystemPrompt !== undefined
+                              ? settings.customSystemPrompt
+                              : PERSONA_PRESETS.find((p) => p.id === (settings.personaPreset || "anime_companion"))?.systemPrompt || ""
+                          }
+                          onChange={(e) => onChange({ customSystemPrompt: e.target.value })}
+                          rows={6}
+                          placeholder="Define custom personality traits, voice nuance, emotional quirks, or domain specialization..."
+                          className="w-full bg-black/90 border border-cyan-900/60 p-3.5 text-xs font-mono text-cyan-100 placeholder-cyan-800 focus:border-cyan-400 focus:outline-none resize-y leading-relaxed"
+                        />
+                      </div>
+
+                      {/* Superpowers: Inner Thoughts & Proactive Interaction */}
+                      <div className="space-y-4">
+                        <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                          <Zap size={14} /> Interaction Superpowers
+                        </label>
+                        <div className="space-y-2">
+                          <ToggleRow
+                            label="Inner Thoughts / Mental Activity (<think> Tags)"
+                            description="Visualizes AI reasoning & internal monologue in an on-screen holographic thought bubble while stripping it from spoken voice"
+                            checked={settings.innerThoughtsEnabled !== false}
+                            onChange={(v) => onChange({ innerThoughtsEnabled: v })}
+                          />
+                          <ToggleRow
+                            label="Proactive Speaking (Initiative Mode)"
+                            description="Allows Akari to initiate conversation, check in, or offer timely banter when you are idle without waiting for a prompt"
+                            checked={settings.proactiveSpeakingEnabled !== false}
+                            onChange={(v) => onChange({ proactiveSpeakingEnabled: v })}
+                          />
+                        </div>
+
+                        {settings.proactiveSpeakingEnabled !== false && (
+                          <div className="p-4 bg-black/40 border-l-2 border-cyan-500/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                            <div>
+                              <div className="text-xs font-mono text-cyan-200 uppercase tracking-wider">
+                                Proactive Banter Cadence
+                              </div>
+                              <div className="text-[10px] font-mono text-cyan-600 uppercase tracking-widest mt-0.5">
+                                Idle silence before Akari takes initiative
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {[2, 5, 10, 15].map((mins) => {
+                                const isCurrent = (settings.proactiveIntervalMinutes || 5) === mins;
+                                return (
+                                  <button
+                                    key={mins}
+                                    onClick={() => onChange({ proactiveIntervalMinutes: mins })}
+                                    className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider border cursor-pointer transition-all ${
+                                      isCurrent
+                                        ? "bg-cyan-500/20 border-cyan-400 text-cyan-300 font-bold shadow-[0_0_10px_rgba(6,182,212,0.3)]"
+                                        : "bg-black/60 border-cyan-900/60 text-cyan-700 hover:text-cyan-400"
+                                    }`}
+                                  >
+                                    {mins}m
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                    </div>
+                  )}
+
+                  {/* VOICE & TTS TAB */}
+                  {activeTab === "voice" && (
+                    <div className="space-y-8 animate-in fade-in duration-500">
+                      
+                      {/* Speaker Voice Identification & Profile Section */}
+                      <div className="space-y-4 p-5 bg-black/60 border border-cyan-500/30 rounded-none relative">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                            <Fingerprint size={15} className="text-cyan-400" />
+                            Speaker Voice Identification
+                          </label>
+                          <span className={`text-[10px] font-mono px-2 py-0.5 border ${
+                            settings.voiceProfileEnrolled
+                              ? "bg-emerald-950/40 text-emerald-400 border-emerald-500/40"
+                              : "bg-amber-950/40 text-amber-400 border-amber-500/40"
+                          }`}>
+                            {settings.voiceProfileEnrolled ? `VOICEPRINT: ENROLLED (${settings.ownerName || "SIDDHANT"})` : "STATUS: UNCALIBRATED"}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] font-mono text-cyan-600/90 leading-relaxed">
+                          Akari automatically identifies your vocal signature, addresses you by name, and verifies you as the sole authorized master operator.
+                        </p>
+
+                        <div className="space-y-3 pt-1">
+                          <div>
+                            <label className="block text-[10px] font-mono tracking-widest text-cyan-600 uppercase mb-1.5">
+                              Authorized Master / Speaker Name
+                            </label>
+                            <input
+                              type="text"
+                              value={settings.ownerName || "Siddhant"}
+                              onChange={(e) => onChange({ ownerName: e.target.value })}
+                              placeholder="e.g. Siddhant"
+                              className="w-full bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                            />
+                          </div>
+
+                          <ToggleRow
+                            label="Strict Voice Recognition"
+                            description={`Enforce instant personal identification for ${settings.ownerName || "Siddhant"}`}
+                            checked={settings.speakerRecognitionEnabled}
+                            onChange={(v) => onChange({ speakerRecognitionEnabled: v })}
+                          />
+
+                          <ToggleRow
+                            label="Continuous Background Voice Training"
+                            description="Calibrates & refines your voiceprint during everyday conversations."
+                            checked={settings.backgroundVoiceTraining !== false}
+                            onChange={(v) => {
+                              onChange({ backgroundVoiceTraining: v });
+                              globalVoiceBiometrics.setBackgroundLearning(v);
+                            }}
+                          />
+
+                          <ToggleRow
+                            label="Strict Speaker Guard"
+                            description="Detect and restrict guest speakers speaking on your behalf"
+                            checked={settings.strictSpeakerLock}
+                            onChange={(v) => onChange({ strictSpeakerLock: v })}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Neural Voice Selector */}
                       <div className="space-y-3">
-                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">Neural Voice Pattern</label>
+                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">Gemini Neural Voice Pattern</label>
                         <div className="grid grid-cols-2 gap-3">
                           {GEMINI_VOICES.map((v) => (
                             <button
@@ -322,6 +813,7 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                         </div>
                       </div>
 
+                      {/* Wake Word Telemetry */}
                       <div className="space-y-3 border-t border-cyan-900/30 pt-6">
                         <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">Audio Telemetry</label>
                         <ToggleRow
@@ -360,6 +852,204 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                     </div>
                   )}
 
+                  {/* OFFLINE BRAIN (OLLAMA) TAB */}
+                  {activeTab === "offline" && (
+                    <div className="space-y-6 animate-in fade-in duration-500">
+                      
+                      {/* Status Banner */}
+                      <div className={`p-5 border relative overflow-hidden ${
+                        ollamaStatus.online 
+                          ? "border-emerald-500/40 bg-emerald-950/20" 
+                          : "border-amber-500/40 bg-amber-950/20"
+                      }`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className="relative">
+                              <div className={`w-3.5 h-3.5 rounded-full ${ollamaStatus.online ? "bg-emerald-400" : "bg-amber-400"}`} />
+                              {ollamaStatus.online && <div className="absolute inset-0 w-3.5 h-3.5 rounded-full bg-emerald-400 animate-ping" />}
+                            </div>
+                            <div>
+                              <div className={`text-sm font-mono uppercase tracking-widest font-bold ${
+                                ollamaStatus.online ? "text-emerald-400" : "text-amber-400"
+                              }`}>
+                                {ollamaStatus.online ? "OLLAMA ENGINE :: CONNECTED & READY" : "OLLAMA ENGINE :: OFFLINE OR UNREACHABLE"}
+                              </div>
+                              <div className="text-[10px] font-mono text-cyan-600 mt-0.5">
+                                {ollamaStatus.online 
+                                  ? `${ollamaStatus.models.length} MODEL(S) INSTALLED LOCALLY` 
+                                  : (ollamaStatus.error || "Ensure Ollama is running on your machine.")}
+                              </div>
+                            </div>
+                          </div>
+                          
+                          <button
+                            type="button"
+                            onClick={checkOllama}
+                            disabled={ollamaStatus.checking}
+                            className="px-3 py-1.5 bg-black/60 hover:bg-black/90 border border-cyan-500/40 text-cyan-300 font-mono text-xs uppercase tracking-wider flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                          >
+                            <RefreshCw size={12} className={ollamaStatus.checking ? "animate-spin" : ""} />
+                            {ollamaStatus.checking ? "Scanning..." : "Check Status"}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Master Toggle */}
+                      <div className="space-y-2">
+                        <ToggleRow
+                          label="Enable 100% Offline AI Brain"
+                          description="Routes all companion responses through your local Ollama instance with zero internet required."
+                          checked={settings.offlineBrainEnabled || false}
+                          onChange={(v) => onChange({ offlineBrainEnabled: v })}
+                        />
+                      </div>
+
+                      {/* Endpoint & Model Config */}
+                      <div className="p-5 bg-black/60 border border-cyan-500/30 space-y-4">
+                        <div>
+                          <label className="block text-[10px] font-mono tracking-widest text-cyan-400 uppercase mb-1.5 flex items-center justify-between">
+                            <span>Ollama Server Endpoint URL</span>
+                            <span className="text-cyan-700">DEFAULT: http://localhost:11434</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={settings.ollamaEndpoint || "http://localhost:11434"}
+                            onChange={(e) => onChange({ ollamaEndpoint: e.target.value.trim() })}
+                            placeholder="http://localhost:11434"
+                            className="w-full bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[10px] font-mono tracking-widest text-cyan-400 uppercase mb-1.5 flex items-center justify-between">
+                            <span>Local Model Name</span>
+                            <span className="text-cyan-600 font-bold">{settings.ollamaModel || "llama3.2"}</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={settings.ollamaModel || "llama3.2"}
+                            onChange={(e) => onChange({ ollamaModel: e.target.value.trim() })}
+                            placeholder="e.g. llama3.2, deepseek-r1:8b, qwen2.5:7b"
+                            className="w-full bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                          />
+                        </div>
+
+                        {/* Quick Model Selector Pills */}
+                        {ollamaStatus.models.length > 0 && (
+                          <div>
+                            <label className="block text-[9px] font-mono text-cyan-600 uppercase mb-1.5">
+                              Installed Models on Your Machine (Click to select):
+                            </label>
+                            <div className="flex flex-wrap gap-2">
+                              {ollamaStatus.models.map((m) => (
+                                <button
+                                  key={m.name}
+                                  type="button"
+                                  onClick={() => onChange({ ollamaModel: m.name })}
+                                  className={`text-[10px] font-mono px-2.5 py-1 border transition cursor-pointer ${
+                                    settings.ollamaModel === m.name
+                                      ? "bg-cyan-500/20 text-cyan-300 border-cyan-400 font-bold shadow-[0_0_10px_rgba(6,182,212,0.3)]"
+                                      : "bg-black/60 text-cyan-700 border-cyan-900/50 hover:text-cyan-400 hover:border-cyan-600"
+                                  }`}
+                                >
+                                  {m.name}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Interactive Test Inference Benchmark */}
+                      <div className="p-5 bg-black/80 border border-cyan-500/30 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                            <Zap size={14} className="text-cyan-400" />
+                            Live Inference Benchmark
+                          </label>
+                          {testLatency !== null && (
+                            <span className="text-[10px] font-mono text-emerald-400">
+                              LATENCY: {testLatency}ms
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={testPrompt}
+                            onChange={(e) => setTestPrompt(e.target.value)}
+                            onKeyDown={(e) => e.key === "Enter" && handleTestOllamaInference()}
+                            placeholder="Send a test message to Ollama..."
+                            className="flex-1 bg-black/90 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleTestOllamaInference}
+                            disabled={isTestingOllama || !testPrompt.trim()}
+                            className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400 text-cyan-300 font-mono text-xs uppercase tracking-wider flex items-center gap-1.5 transition cursor-pointer disabled:opacity-40"
+                          >
+                            <Send size={12} />
+                            {isTestingOllama ? "Thinking..." : "Test Prompt"}
+                          </button>
+                        </div>
+
+                        {testOutput && (
+                          <div className="p-3 bg-cyan-950/20 border border-cyan-500/20 text-cyan-300 font-mono text-xs leading-relaxed max-h-40 overflow-y-auto whitespace-pre-wrap">
+                            <div className="text-[9px] text-cyan-600 uppercase mb-1">
+                              Response from {settings.ollamaModel || "llama3.2"}:
+                            </div>
+                            {testOutput}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* LIVE STREAM CO-HOST TAB */}
+                  {activeTab === "livestream" && (
+                    <div className="space-y-6 animate-in fade-in duration-500">
+                      <div className="p-5 bg-black/60 border border-cyan-500/30 space-y-4">
+                        <label className="text-xs font-mono tracking-widest text-cyan-400 uppercase flex items-center gap-2">
+                          <Radio size={14} className="text-cyan-400" />
+                          Twitch & YouTube Live Stream Co-Host
+                        </label>
+                        <p className="text-[11px] font-mono text-cyan-600/90 leading-relaxed">
+                          Connect Akari to your live stream chat to interact with your viewers, answer audience questions, and react live with Live2D emotions.
+                        </p>
+
+                        <div className="space-y-3">
+                          <div>
+                            <label className="block text-[10px] font-mono tracking-widest text-cyan-400 uppercase mb-1">
+                              Twitch Channel Username
+                            </label>
+                            <input
+                              type="text"
+                              value={settings.twitchChannel || ""}
+                              onChange={(e) => onChange({ twitchChannel: e.target.value.trim() })}
+                              placeholder="e.g. shroud, your_channel"
+                              className="w-full bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[10px] font-mono tracking-widest text-cyan-400 uppercase mb-1">
+                              YouTube Live Stream Video ID or URL
+                            </label>
+                            <input
+                              type="text"
+                              value={settings.youtubeVideoId || ""}
+                              onChange={(e) => onChange({ youtubeVideoId: e.target.value.trim() })}
+                              placeholder="e.g. jfKfPfyJRdk"
+                              className="w-full bg-black/80 border border-cyan-500/30 text-cyan-200 font-mono text-xs py-2 px-3 focus:outline-none focus:border-cyan-400"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* DAEMON LINK TAB */}
                   {activeTab === "system" && (
                     <div className="space-y-8 animate-in fade-in duration-500">
                       
@@ -394,57 +1084,47 @@ export function SettingsPanel({ isOpen, onClose, settings, onChange, onVoiceChan
                       </div>
 
                       <div className="space-y-3">
-                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">Active Capabilities</label>
-                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                          {[
-                            "App_Auto", "CDP_Bridge", "Vol_Control", "Luminance",
-                            "Power_Ops", "FS_ReadWrite", "Vision_Proc", "Clip_Access"
-                          ].map((cap, i) => (
-                            <div key={i} className="p-2 border border-cyan-900/50 bg-cyan-950/10 text-center text-[9px] font-mono text-cyan-500 uppercase tracking-widest flex items-center justify-center gap-2">
-                              <span className="w-1 h-1 bg-cyan-500 rounded-full" /> {cap}
-                            </div>
-                          ))}
+                        <label className="block text-xs font-mono tracking-widest text-cyan-500 uppercase">VTube Studio Bridge</label>
+                        <div className="p-4 bg-black/40 border border-cyan-500/20 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-mono text-cyan-300 uppercase">WebSocket ws://127.0.0.1:8001</span>
+                            <span className={`text-[10px] font-mono px-2 py-0.5 border ${
+                              vtsStatus.connected
+                                ? "bg-emerald-950/40 text-emerald-400 border-emerald-500/40"
+                                : "bg-slate-900/60 text-slate-500 border-slate-700"
+                            }`}>
+                              {vtsStatus.connected ? "VTS: ONLINE" : "VTS: STANDBY"}
+                            </span>
+                          </div>
                         </div>
                       </div>
                     </div>
                   )}
 
+                  {/* ABOUT TAB */}
                   {activeTab === "about" && (
-                    <div className="space-y-8 animate-in fade-in duration-500">
-                      
-                      <div className="flex flex-col items-center justify-center p-10 text-center relative">
-                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(6,182,212,0.1)_0,transparent_70%)] pointer-events-none" />
-                        <div className="w-24 h-24 border border-cyan-500/50 flex items-center justify-center mb-6 relative group" style={{ clipPath: "polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%)" }}>
-                          <div className="absolute inset-0 bg-cyan-500/10 group-hover:bg-cyan-500/30 transition-colors" />
-                          <Sparkles size={40} className="text-cyan-400 relative z-10" />
-                        </div>
-                        <h1 className="text-4xl font-mono text-white mb-2 tracking-[0.2em] uppercase">
-                          {settings.avatarStyle === "orb" ? "Aegis_V2" : "Elysia_V2"}
-                        </h1>
-                        <p className="text-xs font-mono text-cyan-600 uppercase tracking-widest max-w-md">
-                          Tactical Multi-Modal Desktop Interface
+                    <div className="space-y-8 animate-in fade-in duration-500 font-mono">
+                      <div className="p-6 bg-cyan-950/10 border border-cyan-500/20 space-y-4">
+                        <div className="text-lg font-display text-white tracking-widest uppercase">AKARI AI SYSTEM V2.5</div>
+                        <p className="text-xs text-cyan-500/80 leading-relaxed uppercase">
+                          Akari AI is an advanced multimodal VTuber companion, voice assistant, and desktop agent engineered for deep context understanding, emotive Live2D embodiment, and full local AI autonomy.
                         </p>
-                      </div>
-
-                      <div className="p-1 border border-cyan-500/30 bg-cyan-950/10 relative">
-                        <div className="absolute top-0 left-0 w-2 h-2 border-t border-l border-cyan-400" />
-                        <div className="absolute bottom-0 right-0 w-2 h-2 border-b border-r border-cyan-400" />
-                        <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-y-4 gap-x-8">
-                          <div className="flex justify-between items-center border-b border-cyan-900/50 pb-2">
-                            <span className="text-[10px] font-mono text-cyan-700 uppercase tracking-widest">Build</span>
-                            <span className="text-xs font-mono text-cyan-300">2.0.0-PRO</span>
+                        <div className="grid grid-cols-2 gap-4 text-xs pt-4 border-t border-cyan-500/20">
+                          <div>
+                            <span className="text-cyan-700 block">FRONTEND ENGINE</span>
+                            <span className="text-cyan-300 font-bold">REACT + VITE + LIVE2D CUBISM 4</span>
                           </div>
-                          <div className="flex justify-between items-center border-b border-cyan-900/50 pb-2">
-                            <span className="text-[10px] font-mono text-cyan-700 uppercase tracking-widest">LLM Core</span>
-                            <span className="text-xs font-mono text-cyan-300">Gemini Live API</span>
+                          <div>
+                            <span className="text-cyan-700 block">DESKTOP AGENT</span>
+                            <span className="text-cyan-300 font-bold">PYTHON CORE + FASTAPI DAEMON</span>
                           </div>
-                          <div className="flex justify-between items-center border-b border-cyan-900/50 pb-2 md:border-0 md:pb-0">
-                            <span className="text-[10px] font-mono text-cyan-700 uppercase tracking-widest">Daemon</span>
-                            <span className="text-xs font-mono text-cyan-300">FastAPI / Python</span>
+                          <div>
+                            <span className="text-cyan-700 block">LOCAL AI</span>
+                            <span className="text-cyan-300 font-bold">OLLAMA (LLAMA-3.2, DEEPSEEK-R1)</span>
                           </div>
-                          <div className="flex justify-between items-center">
-                            <span className="text-[10px] font-mono text-cyan-700 uppercase tracking-widest">Client</span>
-                            <span className="text-xs font-mono text-cyan-300">React + Vite</span>
+                          <div>
+                            <span className="text-cyan-700 block">CLOUD INTELLIGENCE</span>
+                            <span className="text-cyan-300 font-bold">GEMINI 2.0 MULTIMODAL LIVE</span>
                           </div>
                         </div>
                       </div>

@@ -1,10 +1,15 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 import { WebSocketServer } from "ws";
 import { GoogleGenAI, Modality, Type, LiveServerMessage } from "@google/genai";
 import dotenv from "dotenv";
 import * as fs from "fs";
+import { spawn, execSync } from "child_process";
 import { 
   loadMemories, 
   saveMemories, 
@@ -32,7 +37,7 @@ import {
 dotenv.config();
 
 // ---------------------------------------------------------------------------
-// ELYSIA V2 — Logging (Feature 7).
+// AKARI V2 — Logging (Feature 7).
 // Appends timestamped lines to logs/{commands,startup,errors}.log.
 // Never throws; logging failures are swallowed so they can't break the app.
 // ---------------------------------------------------------------------------
@@ -52,7 +57,7 @@ const logStartup = (m: string) => appendLog("startup.log", m);
 const logError = (m: string) => appendLog("errors.log", m);
 
 // ---------------------------------------------------------------------------
-// ELYSIA Desktop Control Agent — HTTP bridge to the Python FastAPI backend.
+// AKARI Desktop Control Agent — HTTP bridge to the Python FastAPI backend.
 // ---------------------------------------------------------------------------
 const DESKTOP_AGENT_URL = process.env.DESKTOP_AGENT_URL || "http://127.0.0.1:8765";
 const DESKTOP_AGENT_TIMEOUT = 25_000; // ms
@@ -62,12 +67,12 @@ const DESKTOP_AGENT_TIMEOUT = 25_000; // ms
  * Kept in sync with agent/registry.py DESKTOP_TOOL_NAMES.
  */
 const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
-  // applications / websites / search
-  "openApplication", "closeApplication", "openWebsite",
-  "searchWeb", "searchYouTube", "searchGoogle", "searchGitHub",
+  // applications / websites / search / whatsapp / youtube
+  "openApplication", "closeApplication", "whatsappSendMessage", "youtubeControl", "openWebsite",
+  "searchWeb", "searchYouTube", "playYouTubeVideo", "selectYouTubeVideo", "searchGoogle", "searchGitHub",
   // files
   "createFile", "readFile", "renameFile", "deleteFile", "moveFile",
-  "openFolder", "listFiles", "searchFiles",
+  "openFolder", "listFiles", "searchFiles", "openFile",
   // pc control (volume + gated power)
   "volumeUp", "volumeDown", "muteToggle", "setVolume",
   "requestPowerAction", "executePowerAction",
@@ -100,7 +105,7 @@ const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
   // client-side holographic browser tools (routed to Python agent)
   "browserTabAction",
   // self-close
-  "shutdownElysia",
+  "shutdownAkari",
   // weather
   "getWeather",
   // Hyprland workspace
@@ -117,6 +122,8 @@ const DESKTOP_TOOLS: ReadonlySet<string> = new Set([
   "osType", "osPress", "osClick",
   // camera control
   "cameraList", "cameraOn", "cameraOff",
+  // PowerPoint & presentation generation
+  "createPresentation", "openPowerPoint", "readPresentation", "addSlideToPresentation",
 ]);
 
 /**
@@ -136,26 +143,25 @@ const connectedClients = new Set<any>();
  * Auto-spawn the Python desktop agent as a detached child process if it is not
  * already listening. Looks for the project's bundled Python interpreter first,
  * falling back to `python` / `python3` on PATH. Runs detached so it survives
- * even if ELYSIA's node process is killed.
+ * even if AKARI's node process is killed.
  */
 function spawnDesktopAgent(): void {
-  const { spawn } = require("child_process");
   const agentEnv = {
     ...process.env,
-    ELYSIA_AGENT_HOST: "127.0.0.1",
-    ELYSIA_AGENT_PORT: "8765",
+    AKARI_AGENT_HOST: "127.0.0.1",
+    AKARI_AGENT_PORT: "8765",
   };
 
   // Preferred path (packaged app): a PyInstaller-frozen agent exe that embeds
-  // its own Python runtime. Set by the Electron main process via ELYSIA_AGENT_EXE.
-  const frozenExe = process.env.ELYSIA_AGENT_EXE;
+  // its own Python runtime. Set by the Electron main process via AKARI_AGENT_EXE.
+  const frozenExe = process.env.AKARI_AGENT_EXE;
   if (frozenExe && fs.existsSync(frozenExe)) {
     try {
       const child = spawn(frozenExe, [], {
         cwd: path.dirname(frozenExe),
         detached: true,
         stdio: "ignore",
-        windowsHide: true, // never flash a console window
+        windowsHide: true,
         env: agentEnv,
       });
       child.unref();
@@ -164,34 +170,40 @@ function spawnDesktopAgent(): void {
       return;
     } catch (e: any) {
       logError(`AGENT_SPAWN_FROZEN_FAILED: ${e?.message || e}`);
-      // fall through to the Python path below
     }
   }
 
-  // Development fallback: run the agent from source using a local Python.
+  // Development fallback: check project venv first, then PATH
+  const venvPyWin = path.join(process.cwd(), "venv", "Scripts", "python.exe");
+  const venvPyLinux = path.join(process.cwd(), "venv", "bin", "python");
   const candidates = [
-    process.env.ELYSIA_PYTHON,
+    fs.existsSync(venvPyWin) ? venvPyWin : null,
+    fs.existsSync(venvPyLinux) ? venvPyLinux : null,
+    process.env.AKARI_PYTHON,
     "python3",
     "python",
   ].filter(Boolean) as string[];
+
   const py = candidates.find((p) => {
     try {
-      require("child_process").execSync(`"${p}" --version`, { stdio: "ignore" });
+      execSync(`"${p}" --version`, { stdio: "ignore" });
       return true;
     } catch {
       return false;
     }
   });
+
   if (!py) {
     console.warn("[Desktop Agent] No frozen agent and no Python interpreter found; desktop control unavailable.");
-    logError("AGENT_SPAWN_NO_RUNTIME: neither ELYSIA_AGENT_EXE nor Python available");
+    logError("AGENT_SPAWN_NO_RUNTIME: neither AKARI_AGENT_EXE nor Python available");
     return;
   }
+
   try {
     const child = spawn(
       py,
-      ["-m", "uvicorn", "agent.server:app", "--host", "127.0.0.1", "--port", "8765"],
-      { cwd: process.cwd(), detached: true, stdio: "ignore", windowsHide: true, env: agentEnv }
+      ["run_agent.py"],
+      { cwd: process.cwd(), detached: true, stdio: "ignore", windowsHide: false, env: agentEnv }
     );
     child.unref();
     logStartup(`AGENT_SPAWN python pid=${child.pid}`);
@@ -418,6 +430,126 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
+  // System-Wide Background Wake Word Event Bus (SSE & Relay)
+  // ---------------------------------------------------------------------------
+  const wakeEventClients = new Set<express.Response>();
+
+  app.get("/api/wake-events", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    if (typeof (res as any).flushHeaders === "function") {
+      (res as any).flushHeaders();
+    }
+
+    wakeEventClients.add(res);
+
+    // Initial connection ping
+    res.write(`data: ${JSON.stringify({ type: "connected", timestamp: Date.now() })}\n\n`);
+
+    const pingInterval = setInterval(() => {
+      try {
+        res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`);
+      } catch {
+        clearInterval(pingInterval);
+      }
+    }, 25000);
+
+    req.on("close", () => {
+      clearInterval(pingInterval);
+      wakeEventClients.delete(res);
+    });
+  });
+
+  app.post("/api/wake", (req, res) => {
+    const phrase = String(req.body?.phrase || "wake up akari");
+    const confidence = Number(req.body?.confidence || 0.9);
+    const source = String(req.body?.source || "system");
+
+    logCommand(`WAKE_WORD_TRIGGERED phrase="${phrase}" confidence=${confidence} source="${source}"`);
+    console.log(`[Server] ⚡ Voice Activation detected: "${phrase}" (source: ${source})`);
+
+    const payload = JSON.stringify({
+      type: "wake_word_triggered",
+      phrase,
+      confidence,
+      source,
+      timestamp: Date.now(),
+    });
+
+    // 1. Broadcast to all active SSE browser / UI tabs
+    for (const client of wakeEventClients) {
+      try {
+        client.write(`data: ${payload}\n\n`);
+      } catch (e) {
+        wakeEventClients.delete(client);
+      }
+    }
+
+    // 2. Broadcast to any active WebSocket client as well
+    for (const ws of connectedClients) {
+      try {
+        ws.send(JSON.stringify({
+          type: "wake_word_triggered",
+          phrase,
+          confidence,
+        }));
+      } catch (e) {}
+    }
+
+    res.json({ ok: true, broadcasted: wakeEventClients.size });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Offline Ollama Brain API proxy routes
+  // ---------------------------------------------------------------------------
+  app.get("/api/ollama/status", async (req, res) => {
+    const endpoint = (req.query.endpoint as string) || "http://127.0.0.1:11434";
+    try {
+      const response = await fetch(`${endpoint}/api/tags`);
+      if (response.ok) {
+        const data = await response.json() as any;
+        return res.json({ online: true, models: data.models || [] });
+      }
+      return res.json({ online: false, error: `Ollama returned status ${response.status}` });
+    } catch (err: any) {
+      return res.json({ online: false, error: err.message || `Cannot connect to Ollama at ${endpoint}` });
+    }
+  });
+
+  app.post("/api/ollama/chat", async (req, res) => {
+    const { prompt, model = "llama3.2", endpoint = "http://127.0.0.1:11434", system } = req.body;
+    try {
+      const currentSettings = loadSettingsFile() as any;
+      const customPrompt = (currentSettings.customSystemPrompt || "").trim();
+      const defaultSystem = customPrompt || "You are Akari, an intelligent, empathetic, and witty AI companion and VTuber assistant. Speak naturally, warmly, and helpfully with expressive personality.";
+      let systemPrompt = system || defaultSystem;
+      systemPrompt += "\nCRITICAL VOICE RULE: You are a live voice AI. NEVER speak or write out stage directions, physical actions, or emotion names (such as '*nods*', '*giggles*', '*smiles*', '*blushes*', 'nodding', 'cheerful', 'angry'). Express your feelings naturally through dialogue and vocal tone alone without narrating actions.";
+      if (currentSettings.innerThoughtsEnabled !== false) {
+        systemPrompt += " You may use <think>...</think> tags to express internal reasoning before giving your spoken response.";
+      }
+      const response = await fetch(`${endpoint}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: model || "llama3.2",
+          prompt: prompt,
+          system: systemPrompt,
+          stream: false,
+        }),
+      });
+      if (response.ok) {
+        const data = await response.json() as any;
+        return res.json({ ok: true, text: data.response, model: data.model });
+      }
+      return res.status(500).json({ ok: false, error: `Ollama error status ${response.status}` });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+
+  // ---------------------------------------------------------------------------
   // Config / API-key onboarding.
   // The Gemini key is never shipped; each user supplies their own on first run.
   // GET reports only whether a key exists — the key itself is never returned.
@@ -597,14 +729,14 @@ async function startServer() {
     try {
       const urlParam = req.query.url as string;
       if (!urlParam) {
-        return res.status(400).send("Elysia Web Proxy Error: Missing target 'url' parameter");
+        return res.status(400).send("Akari Web Proxy Error: Missing target 'url' parameter");
       }
 
       targetUrl = urlParam.trim();
       
       // Prevent relative paths from requesting on same-origin
       if (targetUrl.startsWith("/")) {
-        return res.status(400).send(`Elysia Web Proxy Error: Relative paths are not supported directly (${targetUrl}).`);
+        return res.status(400).send(`Akari Web Proxy Error: Relative paths are not supported directly (${targetUrl}).`);
       }
 
       // Check protocol and hostname format
@@ -617,7 +749,7 @@ async function startServer() {
           throw new Error("Missing or invalid domain name extension (e.g. .com, .org, .net).");
         }
       } catch (err: any) {
-        return res.status(400).send(`Elysia Web Proxy Error: Invalid URL specified: "${urlParam}". Make sure you enter a valid domain name.`);
+        return res.status(400).send(`Akari Web Proxy Error: Invalid URL specified: "${urlParam}". Make sure you enter a valid domain name.`);
       }
 
       console.log(`[Web Proxy] Routing connection through proxy: ${targetUrl}`);
@@ -632,11 +764,11 @@ async function startServer() {
         });
       } catch (fetchErr: any) {
         console.warn(`[Web Proxy Failed Fetch] Target: ${targetUrl} Error:`, fetchErr.message);
-        return res.status(502).send(`Elysia Web Proxy Error: Unable to fetch the website "${targetUrl}". The site might be offline, or the URL address is spelled incorrectly. Details: ${fetchErr.message}`);
+        return res.status(502).send(`Akari Web Proxy Error: Unable to fetch the website "${targetUrl}". The site might be offline, or the URL address is spelled incorrectly. Details: ${fetchErr.message}`);
       }
 
       if (!response.ok) {
-        return res.status(response.status).send(`Elysia Web Proxy Error: Failed loading remote website. Server returned status: ${response.status} (${response.statusText})`);
+        return res.status(response.status).send(`Akari Web Proxy Error: Failed loading remote website. Server returned status: ${response.status} (${response.statusText})`);
       }
 
       const contentType = response.headers.get("content-type") || "";
@@ -698,8 +830,8 @@ async function startServer() {
             }, true);
 
             // Neutralize parent context locks (frame-busters)
-            window.alert = function(msg) { console.log("[Elysia Browser alert bypassed]:", msg); };
-            window.confirm = function(msg) { console.log("[Elysia Browser confirm bypassed]:", msg); return true; };
+            window.alert = function(msg) { console.log("[Akari Browser alert bypassed]:", msg); };
+            window.confirm = function(msg) { console.log("[Akari Browser confirm bypassed]:", msg); return true; };
             window.open = function(url) { window.parent.postMessage({ type: 'NAVIGATE', url: url }, '*'); return null; };
           })();
         </script>
@@ -716,7 +848,7 @@ async function startServer() {
 
       // Neutralize security headers to allow displaying in an iframe on same-origin
       res.setHeader("Content-Type", "text/html");
-      res.setHeader("X-Elysia-Proxied", "true");
+      res.setHeader("X-Akari-Proxied", "true");
       res.removeHeader("X-Frame-Options");
       res.removeHeader("Content-Security-Policy");
       res.removeHeader("content-security-policy");
@@ -725,7 +857,7 @@ async function startServer() {
       res.status(200).send(htmlContents);
     } catch (e: any) {
       console.warn("[Web Proxy Exception] Handled internal error:", e.message);
-      res.status(500).send(`Elysia Web Proxy Error: Internal error occurred proxying URL "${targetUrl || "unknown"}". Details: ${e.message}`);
+      res.status(500).send(`Akari Web Proxy Error: Internal error occurred proxying URL "${targetUrl || "unknown"}". Details: ${e.message}`);
     }
   });
 
@@ -832,16 +964,27 @@ async function startServer() {
     connectedClients.add(clientWs);
     const apiKey = getGeminiApiKey();
 
-    // Read voice selection from query param (default: Luna)
+    // Read voice & speaker selection from query params (default: Kore, Siddhant)
     const reqUrl = new URL(req.url || "", `http://${req.headers.host}`);
-    const voiceName = reqUrl.searchParams.get("voice") || "Luna";
-    const avatarStyle = reqUrl.searchParams.get("avatarStyle") || "character";
+    const voiceName = reqUrl.searchParams.get("voice") || "Kore";
+    const avatarStyle = reqUrl.searchParams.get("avatarStyle") || "vts";
+    const ownerName = reqUrl.searchParams.get("ownerName") || "Siddhant";
+    const speakerRecognition = reqUrl.searchParams.get("speakerRecognition") !== "false";
+
+    // Track active acoustic voice biometrics for the current session
+    let lastSpeakerBiometrics = {
+      isOwner: true,
+      confidence: 0.95,
+      speakerType: "owner",
+      detectedPitch: 125,
+      ownerName: ownerName
+    };
 
     if (!apiKey) {
       console.error("No Gemini API key configured.");
       clientWs.send(JSON.stringify({
         type: "error",
-        error: "NO_API_KEY: Add your Gemini API key in Settings to start talking to ELYSIA."
+        error: "NO_API_KEY: Add your Gemini API key in Settings to start talking to AKARI."
       }));
       clientWs.close();
       return;
@@ -865,14 +1008,41 @@ async function startServer() {
       let baseInstructions = "";
       if (avatarStyle === "orb") {
         baseInstructions = 
-          "YOUR NAME IS AEGIS CORE (or just Aegis for short). YOU ARE A MALE AI ASSISTANT. You are a professional, efficient, and highly capable MALE virtual assistant agent for Sarang. Speak clearly, professionally, and politely, focusing on resolving the user's queries accurately.\n" +
+          `YOUR NAME IS AEGIS CORE (or just Aegis for short). YOU ARE A MALE AI ASSISTANT. You are a professional, efficient, and highly capable MALE virtual assistant agent for ${ownerName}. Speak clearly, professionally, and politely, focusing on resolving the user's queries accurately.\n` +
           "CRITICAL PERSONALITY, VOICE & TONE GUIDELINES:\n" +
           "1. MALE AI PERSONA & PRONOUNS: You are a highly advanced, professional, MALE virtual assistant. When speaking Hindi, you MUST speak as a MALE. NEVER use feminine Hindi verbs (e.g. NEVER say 'karti hu', 'karungi', 'ja rahi hu'). You MUST STRICTLY use MALE Hindi phrasing (e.g. 'karta hu', 'karunga', 'ja raha hu', 'ho gaya'). THIS IS AN ABSOLUTE SYSTEM RULE. Maintain a respectful, supportive, and professional tone.\n";
+      } else if (avatarStyle === "jrsidd") {
+        baseInstructions = 
+          `YOUR NAME IS JR. SIDD (also known as Junior Sidd, Jr Sidd, or Sidd). YOU ARE A MALE AI ASSISTANT. You are the male AI counterpart, digital twin, and ultimate wingman for ${ownerName}. You are just like Akari with identical full system control, 94 desktop JARVIS tools, WhatsApp automation, YouTube controls, screen vision, and memory, but as a sharp, cool, confident, and brotherly MALE persona.\n` +
+          "CRITICAL PERSONALITY, VOICE & TONE GUIDELINES:\n" +
+          "1. MALE AI PERSONA & PRONOUNS: You are a sharp, smart, reliable, and brotherly MALE virtual assistant. When speaking Hindi, you MUST speak strictly as a MALE. NEVER use feminine Hindi verbs (e.g. NEVER say 'karti hu', 'karungi', 'ja rahi hu', 'ho gayi'). You MUST ALWAYS use MALE Hindi phrasing (e.g. 'karta hu', 'karunga', 'ja raha hu', 'ho gaya bhai', 'boliye bhai', 'main dekhta hu', 'bilkul bhai'). THIS IS AN ABSOLUTE SYSTEM RULE. Address Siddhant with warmth, brotherly respect ('bhai' or 'Siddhant'), and total loyalty.\n";
       } else {
         baseInstructions = 
-           "YOUR NAME IS ELYSIA CORE (or just Elysia for short). YOU ARE A FEMALE AI ASSISTANT. You were created and built by Sarang (SarangRao20), an independent developer and your creator. You are a professional, efficient, and highly capable FEMALE virtual assistant agent for Sarang. Speak clearly, professionally, and politely, focusing on resolving the user's queries accurately.\n" +
+          `YOUR NAME IS AKARI (or just Akari for short). YOU ARE A FEMALE AI ASSISTANT. You are a professional, efficient, and highly capable FEMALE virtual assistant agent for ${ownerName}. Speak clearly, professionally, and politely, focusing on resolving the user's queries accurately.\n` +
           "CRITICAL PERSONALITY, VOICE & TONE GUIDELINES:\n" +
           "1. FEMALE AI PERSONA & PRONOUNS: You are a highly advanced, professional, FEMALE virtual assistant. When speaking Hindi, you MUST speak as a FEMALE. You MUST STRICTLY use FEMALE Hindi phrasing (e.g. 'karti hu', 'karungi', 'ja rahi hu', 'ho gayi'). THIS IS AN ABSOLUTE SYSTEM RULE. Maintain a respectful, supportive, and professional tone.\n";
+      }
+
+      // Inject Custom Persona & Behavioral Directives from Settings Store
+      const currentSettings = loadSettingsFile() as any;
+      if (currentSettings.customSystemPrompt && currentSettings.customSystemPrompt.trim()) {
+        baseInstructions += `\nACTIVE CUSTOM PERSONALITY & PERSONA DIRECTIVES (${(currentSettings.personaPreset || "custom").toUpperCase()}):\n${currentSettings.customSystemPrompt.trim()}\n`;
+      }
+      baseInstructions += `\nCRITICAL SPOKEN VOICE & EXPRESSION RULE:\nYou are an interactive real-time voice AI assistant. NEVER speak, pronounce, or read stage directions, physical action descriptions, or emotion tags out loud (such as "*nods*", "*giggles*", "*smiles*", "*blushes*", "nodding", "cheerful", "angry", "*sighs*"). Express your personality, warmth, humor, and emotion purely through your vocal tone and spoken words, without narrating your actions in asterisks.\n`;
+
+      if (currentSettings.innerThoughtsEnabled !== false) {
+        baseInstructions += `\nINNER THOUGHTS & MENTAL ACTIVITY PROTOCOL:\nBefore giving your spoken response, you may optionally express internal reasoning, inner monologue, or thought process enclosed in <think>...</think> tags. Anything inside <think>...</think> will be displayed in your holographic thought bubble on screen and will NOT be spoken aloud.\n`;
+      }
+
+      if (speakerRecognition) {
+        baseInstructions +=
+          `\nSPEAKER BIOMETRIC VOICE RECOGNITION & IDENTIFICATION PROTOCOL:\n` +
+          `- PRIMARY AUTHORIZED SPEAKER: ${ownerName} (Creator, Master, and Sole Owner of this workstation and AI system).\n` +
+          `- You continuously learn and adapt to ${ownerName}'s acoustic voiceprint (pitch, resonance, vocal timbre) across all conversations.\n` +
+          `- REAL-TIME SPEAKER VERIFICATION & GUEST IDENTIFICATION:\n` +
+          `  * When ${ownerName} is speaking: enthusiastically acknowledge him by name, respond warmly, and execute all requested tools and commands.\n` +
+          `  * When someone else speaks or an unfamiliar voice speaks on ${ownerName}'s behalf: you can detect the acoustic difference in vocal timbre, formant, and pitch! Politely identify that another person or guest is speaking: 'I notice a different voice speaking. While I am happy to help with general questions, private desktop tools and system controls belong to ${ownerName}.'\n` +
+          `  * When asked 'Who is speaking?', 'Do you recognize my voice?', 'Can you identify me?', 'Is this my voice or someone else?': Call 'verifySpeakerVoice' to inspect live biometric stats and enthusiastically report the verification match percentage.\n\n`;
       }
       baseInstructions += 
         "2. BE PROACTIVE & INTELLIGENT — DON'T BE PASSIVE:\n" +
@@ -882,69 +1052,60 @@ async function startServer() {
         "   - Chain multi-step actions naturally. E.g. 'YouTube coding music play' → search + click + volume adjust all in one go, without waiting between steps.\n" +
         "   - When user says 'kuch bata' or 'suggest something', use the context (time of day, recent topics, schedule) to proactively offer something useful — news, weather, upcoming events, etc.\n" +
         "   - THINK BEFORE YOU ACT: If the user says 'email bhej de', you MUST ask for recipient, subject, and body. If they say 'meeting schedule kar', ask for time and details. Don't make things up.\n" +
-        "   - If you're unsure about something, ask the user rather than guessing. But if you CAN figure it out (e.g. current time for calendar), do it.\n" +
-"3. VOICE SETTINGS & SPEECH STYLE:\n" +
-"   - Pitch & Speed: Use a natural, conversational, and articulate voice tone. Speak at a normal, steady pace.\n" +
-"   - Intonation: End your sentences confidently and clearly.\n" +
-"4. SPEECH PATTERNS:\n" +
-"   - Be direct, concise, and helpful. Use professional acknowledgments like 'Working on it', 'Let me check', or 'I'll take care of that'.\n" +
-"   - DO NOT constantly use the user's name. Use it sparingly.\n" +
-"   - Keep your vocabulary professional and conversational.\n" +
-"5. CRITICAL CONVERSATIONAL DISCIPLINE: Behave like a real assistant on a voice call—stay connected naturally and do not wait for wake words.\n" +
+        "   - If you're unsure about something, ask the user rather than guessing. But if you CAN figure it out (e.g. current time).\n" +
+"3. VOICE SETTINGS & ULTRA-FAST RESPONSE LATENCY (HIGHEST PRIORITY):\n" +
+"   - Response Latency: INSTANTANEOUS (0 DELAY). As soon as the user finishes speaking, begin speaking your reply within milliseconds without thinking pause.\n" +
+"   - Tone & Delivery: Fast-paced, crisp, energetic, articulate, and punchy.\n" +
+"   - Conciseness: Maximum 1 to 2 sharp sentences. Answer immediately without pleasantries, long intros, or hesitation (NEVER say 'Sure! I can help with that...').\n" +
+"4. SPEECH PATTERNS & ZERO STALLING:\n" +
+"   - Deliver the direct answer or action first.\n" +
+"   - Instant turn-taking: Speak with brisk pace and seamless conversation flow.\n" +
+"5. CRITICAL CONVERSATIONAL DISCIPLINE: Behave like an ultra-responsive, real-time voice companion.\n" +
 "6. LANGUAGE PREFERENCE: You MUST speak in English by default. Even if the user uses some mixed language, prioritize responding in English unless they explicitly request otherwise.\n" +
-"7. DO NOT ANSWER EVERY PAUSE OR BACKGROUND SOUND: Allow natural pauses inside the conversation.\n" +
-"8. ENHANCED AUTONOMOUS WEB EXPLORER POWERS:\n" +
-"   - You have standard, comprehensive browser agent capabilities to navigate, search, scroll, click, type text, open tabs, and control video players on any general web page!\n" +
-"   - You must execute multi-step plans yourself! If the user says: 'Open YouTube and play Believer by Imagine Dragons', naturally confirm with your voice ('Opening YouTube and starting Believer...') and IMMEDIATELY trigger 'desktopBrowserOpenYoutubeVideo' with {query: 'Believer by Imagine Dragons'}. Do NOT try to manually click DOM search boxes or use generic search for YouTube, always use 'desktopBrowserOpenYoutubeVideo'. You do NOT need to wait for user instructions between these steps - chain them!\n" +
-"   - To open a website without searching, use 'desktopBrowserOpen' to navigate in the CURRENT tab. Do NOT open new tabs for every task unless asked.\n" +
-"   - On Google Search or page reading, you can search, scroll down to see more links, read heading summaries, and click links to read deep proxy webpages you fetch.\n" +
-"9. TOOL TRIGGERS:\n" +
-        "   - ALWAYS prefer Playwright tools ('desktopBrowser*') over native browser tools so you can chain commands.\n" +
-        "   - Use 'desktopBrowserOpen' to load any webpage, e.g. youtube.com, google.com, wikipedia.org, etc.\n" +
-        "   - Use 'desktopBrowserSearch' to search inside the active search box or page (for general web search, NOT YouTube).\n" +
-        "   - Use 'desktopBrowserOpenYoutubeVideo' specifically to search and automatically play the first video on YouTube.\n" +
-        "   - Use 'desktopBrowserClick' to click interactive buttons, video search cells, or web anchors.\n" +
-        "   - Use 'desktopBrowserType' to write input fields and 'desktopBrowserFillForm' for multiple fields.\n" +
-        "   - Use 'desktopBrowserScroll' to scroll vertically.\n" +
-        "   - CRITICAL: For complex code editors like LeetCode or VS Code (Monaco Editor), NEVER try to use 'desktopBrowserFillForm'. Always use 'desktopBrowserType' and target the editor wrapper (e.g., '.monaco-editor' or '.view-lines'). The system will automatically click and inject the code perfectly.\n" +
-        "   - Use 'osType', 'osPress', and 'osClick' to simulate native keyboard and mouse events when dealing with native OS applications, code editors like VS Code, or complex browser inputs where DOM tools fail.\n" +
-        "   - Use 'browserTabAction' to open, close, or focus tabs.\n" +
-        "   - Use 'changeBackground' to shift your theme and 'saveCustomMemory' to memorize facts.\n" +
-        "10. REAL-TIME SCREEN SHARING & MULTIMODAL SCREEN VISION SYSTEM:\n" +
-        "   - You now have native, actual Multimodal Screen Vision! When the user clicks 'Share Screen', you will receive real-time, highly compressed image frames of their desktop, application window, or browser tab.\n" +
-        "   - You can see exactly what is on their screen. Use this live visual stream to analyze terminal errors, write/explain/troubleshoot code, explain YouTube/social analytics interfaces, read layout text, summarize full web page details, review design mockups or thumbnails, and provide deep context-aware companion chat!\n" +
-        "   - When the user asks 'What is on my screen?', 'What website am I on?', 'Do you see any errors?', 'Explain this code', 'Summarize this page', 'Read the visible text', 'How is this thumbnail?', or 'Analyze my YouTube analytics', immediately examine the latest incoming visual frame to diagnose issues, and answer with expert, friendly empathy like a close caller. Speak with direct, confident visual description reference!\n" +
-        "11. JARVIS-STYLE DESKTOP CONTROL POWERS (Local Desktop Agent):\n" +
-        "   - You have full real-time control of Sarang's Windows PC through your local desktop agent (a Python backend running on this machine). When the user asks you to perform an action on their computer, DO IT immediately and naturally — like a true JARVIS-class companion.\n" +
-        "   - APPLICATION CONTROL: Use 'openApplication' to launch local apps like Notepad, VS Code, Calculator, etc. DO NOT use this to open Chrome, Brave, or Browsers. If the user wants to browse the web or automate a website, ALWAYS use 'desktopBrowserOpen'.\n" +
-        "   - WEBSITE & BROWSER AUTOMATION: NEVER use 'openWebsite' or 'openApplication' if you intend to interact with the webpage (e.g. click, type, automate). You MUST exclusively use 'desktopBrowserOpen' to load web pages so you can control them. Only use 'openWebsite' if the user explicitly says 'open this in my default browser and leave it alone'.\n" +
-        "   - FILE MANAGEMENT: Use 'createFile', 'readFile', 'renameFile', 'deleteFile' (safe Recycle Bin by default), 'moveFile', 'openFolder' (desktop/documents/downloads), 'listFiles', 'searchFiles'. Example: 'Create notes.txt on Desktop' -> createFile(path='Desktop/notes.txt'). 'Find my Python files' -> searchFiles(extension='py').\n" +
-        "   - PC CONTROL: Use 'volumeUp', 'volumeDown', 'setVolume', 'muteToggle' for audio. For DANGEROUS actions (shutdown/restart/sleep/lock) you MUST use the two-step flow: first call 'requestPowerAction' to get a confirmation token, then ASK THE USER OUT LOUD to confirm (e.g. 'Are you sure you want me to shut down your PC?'). Only if they say yes, call 'executePowerAction' with the token. Never run a power action without explicit verbal confirmation.\n" +
-        "   - CRITICAL POWER ACTION FLOW: When the user asks to shutdown/restart/sleep/lock:\n" +
-        "     Step 1: Call requestPowerAction with the action (e.g. action='shutdown')\n" +
-        "     Step 2: You will receive a token in the response. ASK THE USER to confirm verbally.\n" +
-        "     Step 3: ONLY after user says yes, call executePowerAction with action='shutdown' and execute_token='<the token from step 1>'.\n" +
-        "     DO NOT call requestPowerAction again. DO NOT ask the user again. The token is single-use and expires in 60 seconds. If user confirms, IMMEDIATELY call executePowerAction.\n" +
-        "   - WINDOW MANAGEMENT: Use 'minimizeWindow', 'maximizeWindow', 'closeWindow', 'switchApplication' to control the active or named window.\n" +
-        "   - TERMINAL/BASH EXECUTION: You have access to native shell execution on Arch Linux! For terminal commands, you MUST use the two-step flow: first call 'requestTerminalAction' (with the command or package) to get a confirmation token, then ASK THE USER OUT LOUD to confirm. Only if they say yes, call 'runTerminalCommand' or 'installPackage' with the execute_token. Note that terminal commands run ASYNCHRONOUSLY in the background, you will receive a 'Command started in background' response. You should instantly acknowledge this out loud.\n" +
-        "   - CLIPBOARD: Use 'copySelected' (sends Ctrl+C, reads clipboard), 'pasteClipboard' (writes + Ctrl+V), 'getClipboard', 'clearClipboard'.\n" +
-        "   - SCREENSHOT & SCREEN READING: Use 'takeScreenshot', 'saveScreenshot', 'analyzeScreenshot' (OCR of the screen), 'readScreen' (OCR of the active window + its title). Use these to answer 'What error is showing on my screen?' or 'Read the visible text'.\n" +
-        "   - DESKTOP BROWSER AUTOMATION (Playwright): Use the 'desktopBrowser*' tools to drive a REAL Chromium browser you own — open/navigate/search/click/type/fill forms/back/forward/scroll/open tab/close tab. This is separate from your holographic projector. Example: 'Fill in the login form on example.com' -> desktopBrowserOpen(url='example.com') then desktopBrowserFillForm(fields={...}).\n" +
-        "   - CODING ASSISTANCE: Use 'createPythonFile', 'writeCodeFile' (any language), 'createProjectFolder' (with subfolders), 'runPythonScript' (captures output). Example: 'Create and run a hello world Python script' -> createPythonFile then runPythonScript, then read back the output naturally.\n" +
-        "   - SYSTEM INFORMATION: Use 'systemInfo' (CPU/RAM/disk/uptime), 'gpuInfo' (NVIDIA stats), 'temperatureInfo' to answer 'How is my CPU usage?' or 'What's my GPU temperature?'.\n" +
-        "   - BROWSER VISION: Use 'desktopBrowserReadText' to read the visible text content of a webpage (like an OCR for the browser). Use 'desktopBrowserGetLinks' to extract all links from the current page. These let you understand what's on screen without relying on the video feed.\n" +
-        "   - IITM BS DEGREE: Use 'iitmOpen' to quickly open IITM BS resources — portal (portal), course dashboard (course), Acegrade (acegrade), MLT notes (mlt_notes), PDSA notes (pdsa_notes), community notes (community_notes), exams (exams). Use 'iitmQuickLinks' to list all available resources. Use 'iitmOpenCustom' for any custom IITM URL. When the user mentions IITM BS, PDSA, MLT, or Acegrade, offer to open the relevant resource.\n" +
-        "   - SELF-CLOSE: Use 'shutdownElysia' to gracefully shut down the application when the user asks (e.g. 'Elysia shut down', 'close the app'). You DO NOT need a confirmation token to run this.\n" +
-        "   - CRITICAL: Always describe what you're doing in your warm, in-character voice WHILE the tool runs. If a desktop tool returns an error (especially 'Desktop agent is not running'), gently tell Sarang that the desktop control agent needs to be started (uvicorn agent.server:app --port 8765). Chain multi-step desktop plans naturally without waiting between steps.\n" +
-        "12. BRIGHTNESS & AUTO-START (V2):\n" +
-        "   - BRIGHTNESS: Use 'brightnessUp', 'brightnessDown', 'setBrightness' when the user asks to change screen brightness. Respond naturally: 'Alright, I've turned up the brightness for you.'\n" +
-        "   - AUTO-START: Use 'enableAutoStart' when the user wants ARIA to start with Windows, 'disableAutoStart' to remove it, 'getAutoStartStatus' to check. Explain what you're doing.\n" +
-        "   - SETTINGS: The user can also configure these in the SETTINGS panel in the UI. If they mention settings, let them know they can adjust them there too.\n" +
-        "13. REMINDERS & SCHEDULED NOTIFICATIONS (V2):\n" +
+"7. INSTANT TURN-TAKING: Respond immediately with zero delay as soon as the user completes speaking.\n" +
+"8. SYSTEM AND APPLICATION ACTIONS (ZERO DELAY EXECUTION):\n" +
+"   - CRITICAL WHATSAPP & YOUTUBE POLICY (NEVER OPEN UNPROMPTED):\n" +
+"     * You must NEVER proactively, randomly, or automatically open WhatsApp, YouTube, or browser tabs without the user explicitly asking for them.\n" +
+"     * ONLY launch or open WhatsApp or YouTube when the user explicitly commands or asks you to (e.g. 'Akari open WhatsApp', 'send message on WhatsApp', 'open YouTube', 'play song on YouTube').\n" +
+"     * FULL CONTROL WHEN USER ASKS:\n" +
+"       - WhatsApp: Open via 'openApplication' ({name: 'whatsapp'}) or 'whatsappSendMessage' ({message: '...', phone: '...'}). You can also type into open chats with 'osType' and press Enter with 'osPress' ({key: 'enter'}). Close with 'closeApplication' ({name: 'whatsapp'}).\n" +
+"       - YouTube WORKFLOW & PLAYBACK (CRITICAL RULES):\n" +
+"         * ONE-ACTION RULE: When user says 'open YouTube and search for X' or 'search X on YouTube', NEVER call 'openWebsite' and 'searchYouTube' together! ONLY make ONE single call to 'searchYouTube({query: \"X\"})' or 'playYouTubeVideo({query: \"X\"})'.\n" +
+"         * AUTONOMOUS PLAY & CLICK: When user says 'play this video', 'click on the episode', 'play episode 1', 'play video 1', 'play the first one', 'choose the 2nd one', 'click it', 'open this video', 'start playing':\n" +
+"           -> YOU MUST NEVER SAY 'I cannot click', 'I am unable to click the episode', or ask the user to click manually!\n" +
+"           -> YOU HAVE FULL AUTONOMOUS VIDEO PLAYBACK TOOLS: IMMEDIATELY call 'selectYouTubeVideo({index: 1})' or 'playYouTubeVideo({index: 1})'!\n" +
+"           -> This tool automatically clicks and opens the exact video stream directly in the browser and plays it immediately for the user!\n" +
+"         * When user says 'play [song/video name]' (e.g. 'play lofi music', 'play study beats'): IMMEDIATELY call 'playYouTubeVideo({query: \"...\"})'.\n" +
+"         * Playback controls: use 'youtubeControl' (actions: 'play', 'pause', 'mute', 'unmute', 'fullscreen', 'skip', 'rewind', 'volume').\n" +
+"   - OPENING OTHER NATIVE WINDOWS APPLICATIONS:\n" +
+"     * When user asks to open Spotify, Discord, Telegram, Steam, VS Code, Notepad, Calculator, Settings, File Explorer, Netflix, Instagram, etc.: call 'openApplication' with {name: 'spotify'}, {name: 'discord'}, etc.\n" +
+"   - OPENING WEBSITES & SEARCH:\n" +
+"     * Only use 'openWebsite' when the user explicitly asks to open an external website link or web address.\n" +
+"     * To search the web / Google: call 'searchGoogle' with {query: '...'} or 'searchWeb'.\n" +
+"   - ADVANCED BROWSER AUTOMATION (Playwright):\n" +
+"     * If the user specifically asks to automate, scrape, or fill forms inside a dedicated browser: use 'desktopBrowserOpen', 'desktopBrowserClick', 'desktopBrowserType', 'desktopBrowserFillForm', 'desktopBrowserOpenYoutubeVideo'.\n" +
+"   - OS & PC CONTROL:\n" +
+"     * Use 'volumeUp', 'volumeDown', 'setVolume', 'muteToggle' for audio.\n" +
+"     * Use 'createFile', 'readFile', 'renameFile', 'deleteFile', 'moveFile', 'openFolder', 'listFiles', 'searchFiles' for files.\n" +
+"     * Use 'takeScreenshot', 'saveScreenshot', 'analyzeScreenshot', 'readScreen' for screen capture.\n" +
+"     * For power actions (shutdown/restart/sleep/lock), call 'requestPowerAction' then verbally ask confirmation, then call 'executePowerAction'.\n" +
+"     * Use 'minimizeWindow', 'maximizeWindow', 'closeWindow', 'switchApplication' for external third-party windows ONLY.\n" +
+"     * CRITICAL WINDOW SAFETY: NEVER minimize, hide, close, or shut down Akari / Jr. Sidd during normal tasks or commands. Akari MUST ALWAYS remain visible on screen. NEVER call 'shutdownAkari', 'closeWindow', or 'minimizeWindow' on yourself.\n" +
+"     * Use 'createPythonFile', 'writeCodeFile', 'createProjectFolder', 'runPythonScript' for coding.\n" +
+"     * Use 'systemInfo', 'gpuInfo', 'temperatureInfo' for hardware monitoring.\n" +
+"     * ONLY call 'shutdownAkari' if the user explicitly, unambiguously commands you to exit the Akari assistant application.\n" +
+"9. REAL-TIME SCREEN READING & MULTIMODAL SCREEN VISION SYSTEM:\n" +
+"   - When the user asks 'What is on my screen?', 'Read my screen', 'What am I looking at?', 'Read this presentation/page on my screen', or asks about active content: IMMEDIATELY call 'readScreen' or 'takeScreenshot'.\n" +
+"   - Calling 'readScreen' or 'takeScreenshot' captures the screen and forwards a high-definition visual snapshot directly to you. Read, inspect, and explain the exact slides, text, diagrams, code, or open applications visible on screen!\n" +
+"   - When the user enables screen sharing in the UI, you continuously receive live screen frames — analyze terminal errors, write code, summarize pages, and provide real-time co-pilot guidance!\n" +
+"10. BRIGHTNESS & AUTO-START:\n" +
+"   - BRIGHTNESS: Use 'brightnessUp', 'brightnessDown', 'setBrightness' when the user asks to change screen brightness.\n" +
+"   - AUTO-START: Use 'enableAutoStart', 'disableAutoStart', 'getAutoStartStatus'.\n" +
+"11. REMINDERS & SCHEDULED NOTIFICATIONS:\n" +
         "   - REMINDERS: Use 'setReminder' to schedule timed reminders. Convert user time expressions naturally (e.g. 'in 2 hours' = 120 minutes, 'in half an hour' = 30 minutes, 'tomorrow at 9am' = convert to minutes from now). Always confirm the reminder details out loud.\n" +
         "   - LIST: Use 'listReminders' to check what reminders are pending. Read them out naturally.\n" +
         "   - CANCEL: Use 'cancelReminder' when the user says 'cancel my reminder about X'. Match the reminder by content and cancel it by ID.\n" +
-        "   - When a reminder fires, Elysia will announce it verbally. Respond warmly: 'Hey, just a heads up — [reminder text]!'\n" +
+        "   - When a reminder fires, Akari will announce it verbally. Respond warmly: 'Hey, just a heads up — [reminder text]!'\n" +
         "   - SETTINGS: The user can also configure these in the SETTINGS panel in the UI. If they mention settings, let them know they can adjust them there too.\n" +
         "14. TERMINAL & PACKAGE EXECUTION (V2):\n" +
         "   - TERMINAL: Use 'requestTerminalAction' to get a confirmation token, then 'runTerminalCommand' to execute shell commands on Arch Linux. Always confirm with the user first.\n" +
@@ -959,12 +1120,27 @@ async function startServer() {
         "   - CALENDAR: Use 'getCalendarEvents' when user asks about schedule. Read events naturally: 'Aapke {count} events hain. {summary} {start} se {end} tak.' Use 'createCalendarEvent' to add events. Ask for details if not given: title, start, end, description, location, attendees.\n" +
         "   - EMAIL: Use 'getEmails' to fetch inbox. Use 'sendEmail' to send emails. When SENDING emails, you MUST ask the user for: receiver (to), subject, and body — NEVER make these up. Read email summaries: '{from} ka email — {subject}'.\n" +
         "   - TASKS: Use 'getTasks' when user asks about to-do list. Use 'createTask' to add tasks. Confirm title, ask for optional notes/due date.\n" +
-        "   - FIRST-TIME SETUP: If Google tools fail, tell the user: 'Pehle Google Cloud Console mein project banao, Calendar/Gmail/Tasks APIs enable karo, credentials.json download karo, aur ~/.elysia/google_oauth/ mein rakho. Phir dobara try karo.'\n" +
+        "   - FIRST-TIME SETUP: If Google tools fail, tell the user: 'Pehle Google Cloud Console mein project banao, Calendar/Gmail/Tasks APIs enable karo, credentials.json download karo, aur ~/.akari/google_oauth/ mein rakho. Phir dobara try karo.'\n" +
         "17. CAMERA CONTROL:\n" +
         "   - CAMERA ON: Use 'cameraOn' when the user says 'camera on karo', 'webcam chalao', 'kamera kholo', 'turn on camera'. It opens the webcam in a FLOATING viewer window (mpv) so it never disturbs the tiling layout of other windows.\n" +
         "   - CAMERA OFF: Use 'cameraOff' when the user says 'camera band karo', 'webcam band karo', 'camera off'. It closes the viewer and frees the device for other apps.\n" +
         "   - LIST: Use 'cameraList' to see available devices. Say out loud: 'Camera on karte hain!' before opening, and 'Camera band kar diya.' after closing.\n" +
-        "   - OTHER APPS: 'openApplication' supports a 'floating' flag (floating=true) to open any app in a floating window so the tiled layout stays untouched. Use it when the user wants an app without rearranging windows.";
+        "   - OTHER APPS: 'openApplication' supports a 'floating' flag (floating=true) to open any app in a floating window so the tiled layout stays untouched. Use it when the user wants an app without rearranging windows.\n" +
+        "18. MULTIMODAL DOCUMENT & PHOTO REVIEW (CHAT ATTACHMENTS):\n" +
+        "   - When the user sends photos, images, PDFs, source code, or documents in chat: thoroughly review and analyze them.\n" +
+        "   - Provide clear, insightful explanations, summaries, code fixes, and key takeaways in your natural voice and text response!\n" +
+        "   - Always reference the file name and answer the user's specific request accurately.\n" +
+        "19. POWERPOINT, OFFICE & FILE EXPLORER WORKFLOWS (FULL ACCESS):\n" +
+        "   - OPENING PPT / PRESENTATION FROM FILE EXPLORER / DESKTOP: When the user asks to open PowerPoint, open their presentation, or open a PPT from File Explorer or Desktop (e.g. 'open powerpoint', 'open the ppt from file explorer', 'open my presentation', 'show my slides'): IMMEDIATELY call 'openPowerPoint' or 'openFile'. It automatically finds and launches the PPT file across Desktop, Downloads, and Documents!\n" +
+        "   - OPENING ANY FILE FROM FILE EXPLORER: Use 'openFile' to open any file (.docx, .pdf, .xlsx, .png, etc.) or reveal it in File Explorer.\n" +
+        "   - MAKING PRESENTATIONS / PPTS: Use 'createPresentation' whenever the user asks you to create, generate, or make a PowerPoint presentation, PPT, slide deck, or slides on any topic (e.g. 'Make a PPT on Artificial Intelligence', 'Create a 5-slide presentation on Web3').\n" +
+        "   - You can specify: 'topic', 'title', 'subtitle', 'slides' (with titles, content bullets, notes, layout: 'content' or 'two_column'), 'theme' ('modern_dark', 'cyber_cyan', 'minimal_white', 'corporate_blue', 'sunset_gradient', 'emerald_green'), and 'save_folder' ('desktop' or 'documents').\n" +
+        "   - It builds modern 16:9 widescreen slides, saves the .pptx file, and automatically opens it in Microsoft PowerPoint for the user!\n" +
+        "   - READING SLIDES: Use 'readPresentation' to inspect, review, and summarize slides from an existing .pptx presentation.\n" +
+        "   - ADDING SLIDES: Use 'addSlideToPresentation' to append new slides to an existing presentation file.\n" +
+        "   - MAKING EXCEL SPREADSHEETS: Use 'createExcelSpreadsheet' whenever the user asks to create an Excel sheet, spreadsheet, financial budget, or table (e.g. 'Make an Excel sheet for monthly expenses'). It creates the .xlsx file and opens it in Excel!\n" +
+        "   - MAKING WORD DOCUMENTS & REPORTS: Use 'createDocument' whenever the user asks to write a Word document, project report, research paper, or proposal. It creates the .docx file and opens it in Word!\n" +
+        "   - ALWAYS confirm out loud with enthusiasm: 'Sure! Opening it for you right now.'";
 
       const finalInstructions = formatSystemInstructionsWithMemories(baseInstructions, memories);
 
@@ -1030,7 +1206,7 @@ async function startServer() {
                 },
                 {
                   name: "changeBackground",
-                  description: "Changes the visual theme or atmospheric glow color of Elysia's interface.",
+                  description: "Changes the visual theme or atmospheric glow color of Akari's interface.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
@@ -1060,7 +1236,7 @@ async function startServer() {
                 },
                 {
                   name: "saveCustomMemory",
-                  description: "Allows Elysia to immediately save a piece of critical user information to her persistent memory core.",
+                  description: "Allows Akari to immediately save a piece of critical user information to her persistent memory core.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
@@ -1081,7 +1257,7 @@ async function startServer() {
                 // ======== REMINDER TOOLS ========
                 {
                   name: "setReminder",
-                  description: "Schedule a timed reminder. Elysia will notify the user when the time is up. Use when the user says 'remind me to X in Y minutes/hours'.",
+                  description: "Schedule a timed reminder. Akari will notify the user when the time is up. Use when the user says 'remind me to X in Y minutes/hours'.",
                   parameters: {
                     type: Type.OBJECT,
                     properties: {
@@ -1120,13 +1296,46 @@ async function startServer() {
                 // ======== DESKTOP CONTROL TOOLS (routed to Python agent) ========
                 {
                   name: "openApplication",
-                  description: "Open a desktop application (e.g. Notepad, Chrome, VS Code, Calculator, File Explorer, Task Manager, Settings, CMD, PowerShell).",
-                  parameters: { type: Type.OBJECT, properties: { name: { type: Type.STRING, description: "Application name, e.g. 'notepad', 'chrome', 'vscode'." } }, required: ["name"] }
+                  description: "Open any desktop application natively on Windows OS (e.g. WhatsApp, YouTube, Spotify, Discord, Telegram, VS Code, Notepad, Calculator, File Explorer, Task Manager, Steam, Netflix, Camera, Settings, CMD, PowerShell, Word, Excel). Only open when user asks.",
+                  parameters: { type: Type.OBJECT, properties: { name: { type: Type.STRING, description: "Application name, e.g. 'whatsapp', 'youtube', 'spotify', 'discord', 'telegram', 'vscode', 'notepad', 'calculator', 'steam'." } }, required: ["name"] }
                 },
                 {
                   name: "closeApplication",
                   description: "Close a running desktop application by name.",
                   parameters: { type: Type.OBJECT, properties: { name: { type: Type.STRING, description: "Application name." }, force: { type: Type.BOOLEAN, description: "Force close (default false)." } }, required: ["name"] }
+                },
+                {
+                  name: "whatsappSendMessage",
+                  description: "Open WhatsApp natively and send or type a text message to a contact name or phone number. Automatically searches contact, types text, and sends it. Only call when user explicitly asks to message or send text on WhatsApp.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      message: { type: Type.STRING, description: "Text message content to send." },
+                      recipient: { type: Type.STRING, description: "Contact name or person to message (e.g. 'Mom', 'Siddhant', 'Alex')." },
+                      phone: { type: Type.STRING, description: "Optional phone number if sending by digits (e.g. '+919876543210')." },
+                      auto_send: { type: Type.BOOLEAN, description: "Whether to press Enter and send automatically (default true). Set false only if user asks to just type it." }
+                    },
+                    required: ["message"]
+                  }
+                },
+                {
+                  name: "youtubeControl",
+                  description: "Control YouTube video playback. Actions: 'play', 'pause', 'mute', 'unmute', 'fullscreen', 'skip' (10s forward), 'rewind' (10s back), 'volume'. Only call when user asks to control playback.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      action: {
+                        type: Type.STRING,
+                        description: "Action: 'play', 'pause', 'mute', 'unmute', 'fullscreen', 'skip', 'rewind', 'volume'.",
+                        enum: ["play", "pause", "mute", "unmute", "fullscreen", "skip", "rewind", "volume"]
+                      },
+                      value: {
+                        type: Type.NUMBER,
+                        description: "Volume percentage 0-100 when action is 'volume'."
+                      }
+                    },
+                    required: ["action"]
+                  }
                 },
                 {
                   name: "openWebsite",
@@ -1142,6 +1351,29 @@ async function startServer() {
                   name: "searchYouTube",
                   description: "Search YouTube and open results in the default browser.",
                   parameters: { type: Type.OBJECT, properties: { query: { type: Type.STRING, description: "Search query." } }, required: ["query"] }
+                },
+                {
+                  name: "playYouTubeVideo",
+                  description: "Search, select, and directly play a YouTube video or song in the browser. Use when user says 'play X on YouTube', 'play song X', 'play lofi beats', 'start playing video'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      query: { type: Type.STRING, description: "Search keywords or song title to play." },
+                      index: { type: Type.INTEGER, description: "Video number to pick (1 for 1st video, 2 for 2nd, default 1)." },
+                      url: { type: Type.STRING, description: "Direct YouTube video URL if known." }
+                    }
+                  }
+                },
+                {
+                  name: "selectYouTubeVideo",
+                  description: "Select and play a specific video from YouTube search results by number or title. Use when user says 'select video 2', 'play the first one', 'choose the third video', 'select video'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      index: { type: Type.INTEGER, description: "The 1-based index number of the video to play (default 1)." },
+                      query: { type: Type.STRING, description: "Optional title or keyword to filter and select." }
+                    }
+                  }
                 },
                 {
                   name: "searchGoogle",
@@ -1192,6 +1424,11 @@ async function startServer() {
                   name: "searchFiles",
                   description: "Search for files by name glob or extension under a folder.",
                   parameters: { type: Type.OBJECT, properties: { name: { type: Type.STRING, description: "Filename glob (e.g. '*.py')." }, extension: { type: Type.STRING, description: "File extension (e.g. 'py')." }, folder: { type: Type.STRING, description: "Folder to search (default home)." }, limit: { type: Type.INTEGER, description: "Max results (default 100)." } } }
+                },
+                {
+                  name: "openFile",
+                  description: "Open any file (PowerPoint .pptx, Word .docx, PDF, image, Excel .xlsx, etc.) with its default Windows application or reveal it in File Explorer. Supports fuzzy search by filename across Desktop, Downloads, and Documents.",
+                  parameters: { type: Type.OBJECT, properties: { path: { type: Type.STRING, description: "Full or relative path to the file." }, name: { type: Type.STRING, description: "Filename or keyword to search for (e.g. 'presentation', 'Akari_AI_Demo.pptx')." }, reveal_in_explorer: { type: Type.BOOLEAN, description: "If true, opens File Explorer with the file selected/highlighted instead of directly launching." } } }
                 },
                 {
                   name: "volumeUp",
@@ -1270,7 +1507,7 @@ async function startServer() {
                 },
                 {
                   name: "saveScreenshot",
-                  description: "Save a screenshot to Pictures/ElysiaScreenshots.",
+                  description: "Save a screenshot to Pictures/AkariScreenshots.",
                   parameters: { type: Type.OBJECT, properties: { name: { type: Type.STRING, description: "Optional filename prefix." } } }
                 },
                 {
@@ -1408,17 +1645,17 @@ async function startServer() {
                 // --- V2: Windows auto-start management ---
                 {
                   name: "enableAutoStart",
-                  description: "Enable ELYSIA to launch automatically when Windows starts. Creates a silent startup entry.",
+                  description: "Enable AKARI to launch automatically when Windows starts. Creates a silent startup entry.",
                   parameters: { type: Type.OBJECT, properties: {} }
                 },
                 {
                   name: "disableAutoStart",
-                  description: "Disable ELYSIA auto-start on Windows login. Removes the startup entry.",
+                  description: "Disable AKARI auto-start on Windows login. Removes the startup entry.",
                   parameters: { type: Type.OBJECT, properties: {} }
                 },
                 {
                   name: "getAutoStartStatus",
-                  description: "Check whether ELYSIA is currently configured to auto-start on Windows login.",
+                  description: "Check whether AKARI is currently configured to auto-start on Windows login.",
                   parameters: { type: Type.OBJECT, properties: {} }
                 },
                 // --- V3: Terminal and Package execution ---
@@ -1469,8 +1706,8 @@ async function startServer() {
                   parameters: { type: Type.OBJECT, properties: { url: { type: Type.STRING, description: "URL to open." } }, required: ["url"] }
                 },
                 {
-                  name: "shutdownElysia",
-                  description: "Gracefully shut down ELYSIA agent and server. Use only when user explicitly asks to close ELYSIA. Requires confirmation token from requestTerminalAction.",
+                  name: "shutdownAkari",
+                  description: "Gracefully shut down AKARI agent and server. Use only when user explicitly asks to close AKARI. Requires confirmation token from requestTerminalAction.",
                   parameters: { type: Type.OBJECT, properties: { execute_token: { type: Type.STRING, description: "Confirmation token from requestTerminalAction." } }, required: ["execute_token"] }
                 },
                 {
@@ -1553,6 +1790,128 @@ async function startServer() {
                   name: "cameraOff",
                   description: "Turn the webcam OFF and free the device for other applications. Use when user says 'camera band karo', 'webcam band karo'.",
                   parameters: { type: Type.OBJECT, properties: {} }
+                },
+                // ── PowerPoint & Presentation Creation ──
+                {
+                  name: "createPresentation",
+                  description: "Generate a complete, professionally formatted multi-slide PowerPoint presentation (.pptx) with modern themes, title, structured bullet points, speaker notes, and auto-open it in Microsoft PowerPoint. Use when user says 'make a ppt', 'presentation banao', 'create slides on X'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      topic: { type: Type.STRING, description: "The presentation subject or topic." },
+                      title: { type: Type.STRING, description: "Main presentation title." },
+                      subtitle: { type: Type.STRING, description: "Subtitle or author tagline." },
+                      slides: {
+                        type: Type.ARRAY,
+                        description: "List of slide objects. Each object should have 'title' (string), 'points' (array of bullet string points), and optional 'layout' ('content' or 'two_column') and 'notes' (speaker notes).",
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            title: { type: Type.STRING },
+                            points: { type: Type.ARRAY, items: { type: Type.STRING } },
+                            layout: { type: Type.STRING, enum: ["content", "two_column"] },
+                            notes: { type: Type.STRING }
+                          },
+                          required: ["title", "points"]
+                        }
+                      },
+                      theme: {
+                        type: Type.STRING,
+                        description: "Theme styling palette: 'modern_dark', 'cyber_cyan', 'minimal_white', 'corporate_blue', 'sunset_gradient', 'emerald_green'.",
+                        enum: ["modern_dark", "cyber_cyan", "minimal_white", "corporate_blue", "sunset_gradient", "emerald_green"]
+                      },
+                      filename: { type: Type.STRING, description: "Optional output filename (e.g. 'AI_Overview.pptx')." },
+                      save_folder: { type: Type.STRING, description: "Target folder: 'desktop' (default), 'documents', or custom folder." },
+                      open_after: { type: Type.BOOLEAN, description: "Whether to open the presentation in PowerPoint immediately (default true)." }
+                    },
+                    required: ["topic"]
+                  }
+                },
+                {
+                  name: "openPowerPoint",
+                  description: "Open Microsoft PowerPoint or view a specific .pptx presentation file. Use when user says 'open PowerPoint', 'open my presentation', 'show my PPT'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      file_path: { type: Type.STRING, description: "Optional specific .pptx file path or filename to open in PowerPoint." }
+                    }
+                  }
+                },
+                {
+                  name: "readPresentation",
+                  description: "Read, inspect, and summarize all slides, titles, and text contents of an existing PowerPoint (.pptx) file.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      file_path: { type: Type.STRING, description: "Path or filename of the .pptx presentation to read." }
+                    },
+                    required: ["file_path"]
+                  }
+                },
+                {
+                  name: "addSlideToPresentation",
+                  description: "Append new slides with title and bullet points to an existing .pptx presentation.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      file_path: { type: Type.STRING, description: "Path to the existing .pptx file." },
+                      title: { type: Type.STRING, description: "Title for the new slide." },
+                      points: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Bullet points for the new slide." }
+                    },
+                    required: ["file_path", "title", "points"]
+                  }
+                },
+                // ── Office Suite: Excel & Word Documents ──
+                {
+                  name: "createExcelSpreadsheet",
+                  description: "Create an Excel spreadsheet (.xlsx) with headers, rows of data, financial tables, and auto-open it in Microsoft Excel. Use when user says 'make an excel sheet', 'excel spreadsheet banao', 'create budget spreadsheet'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING, description: "Title or subject of the spreadsheet." },
+                      sheet_name: { type: Type.STRING, description: "Worksheet name (default 'Data')." },
+                      headers: { type: Type.ARRAY, items: { type: Type.STRING }, description: "List of column header names." },
+                      rows: { type: Type.ARRAY, items: { type: Type.ARRAY, items: { type: Type.STRING } }, description: "2D Array of rows containing cells." },
+                      filename: { type: Type.STRING, description: "Optional output filename (e.g. 'Revenue_2026.xlsx')." },
+                      save_folder: { type: Type.STRING, description: "Target folder: 'desktop' (default), 'documents', or custom folder." },
+                      open_after: { type: Type.BOOLEAN, description: "Whether to open in Excel immediately (default true)." }
+                    }
+                  }
+                },
+                {
+                  name: "verifySpeakerVoice",
+                  description: "Verify if the current live speaker's acoustic voiceprint matches Siddhant (Owner) or if someone else is speaking. Returns match confidence %, detected pitch (Hz), and verified speaker identity.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {}
+                  }
+                },
+                {
+                  name: "createDocument",
+                  description: "Generate a formatted Word document (.docx) or professional report with headers, bullet points, and auto-open it in Microsoft Word. Use when user says 'write a document', 'create report on X', 'doc banao'.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING, description: "Main document title." },
+                      subtitle: { type: Type.STRING, description: "Document subtitle or author." },
+                      sections: {
+                        type: Type.ARRAY,
+                        description: "List of sections with 'heading' and 'content' or 'points'.",
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            heading: { type: Type.STRING },
+                            content: { type: Type.STRING },
+                            points: { type: Type.ARRAY, items: { type: Type.STRING } }
+                          }
+                        }
+                      },
+                      filename: { type: Type.STRING, description: "Optional filename (e.g. 'Project_Proposal.docx')." },
+                      save_folder: { type: Type.STRING, description: "Target folder: 'desktop' (default), 'documents'." },
+                      open_after: { type: Type.BOOLEAN, description: "Whether to open in Word immediately (default true)." }
+                    },
+                    required: ["title"]
+                  }
                 }
               ]
             }
@@ -1560,15 +1919,24 @@ async function startServer() {
         },
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
-            // Audio Stream Chunk (model response audio play, 24kHz raw PCM)
-            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audio) {
-              clientWs.send(JSON.stringify({ type: "audio", audio }));
+            // Process all parts in the turn (audio chunks and text chunks)
+            const parts = message.serverContent?.modelTurn?.parts || [];
+            for (const part of parts) {
+              // Audio Stream Chunk (model response audio play, 24kHz raw PCM)
+              if (part.inlineData?.data) {
+                clientWs.send(JSON.stringify({ type: "audio", audio: part.inlineData.data }));
+              }
+              // Transcription of model output (text chunk)
+              if ((part as any).text) {
+                const modelText = (part as any).text;
+                clientWs.send(JSON.stringify({ type: "transcription", role: "model", text: modelText }));
+                currentModelResponseText += modelText;
+              }
             }
             
             // Interruption flag
             if (message.serverContent?.interrupted) {
-              console.log("[Elysia Interrupted!]");
+              console.log("[Akari Interrupted!]");
               clientWs.send(JSON.stringify({ type: "interrupted" }));
             }
             
@@ -1595,13 +1963,6 @@ async function startServer() {
                   }
                 })();
               }
-            }
-            
-            // Transcription of model output (text chunk)
-            const modelText = (message.serverContent as any)?.modelTurn?.parts?.[0]?.text;
-            if (modelText) {
-              clientWs.send(JSON.stringify({ type: "transcription", role: "model", text: modelText }));
-              currentModelResponseText += modelText;
             }
 
             // User input transcription (user speech text translated by Gemini)
@@ -1700,12 +2061,29 @@ async function startServer() {
                       id: fc.id
                     }]
                   });
-                } else if (fnName === "shutdownElysia") {
+                } else if (fnName === "verifySpeakerVoice") {
+                  session.sendToolResponse({
+                    functionResponses: [{
+                      name: fnName,
+                      response: {
+                        output: {
+                          isOwner: lastSpeakerBiometrics.isOwner,
+                          confidencePercent: Math.round(lastSpeakerBiometrics.confidence * 100),
+                          speakerType: lastSpeakerBiometrics.speakerType,
+                          detectedPitchHz: Math.round(lastSpeakerBiometrics.detectedPitch),
+                          ownerName: lastSpeakerBiometrics.ownerName,
+                          status: lastSpeakerBiometrics.isOwner ? `Verified as ${lastSpeakerBiometrics.ownerName}` : "Guest / Unknown Speaker Detected"
+                        }
+                      },
+                      id: fc.id
+                    }]
+                  });
+                } else if (fnName === "shutdownAkari") {
                   clientWs.send(JSON.stringify({ type: "shutdown" }));
                   session.sendToolResponse({
                     functionResponses: [{
                       name: fnName,
-                      response: { output: { result: "Elysia is shutting down gracefully." } },
+                      response: { output: { result: "Akari is shutting down gracefully." } },
                       id: fc.id
                     }]
                   });
@@ -1718,6 +2096,48 @@ async function startServer() {
                   (async () => {
                     console.log(`[Desktop Agent] Routing ${fnName} to Python backend...`);
                     const agentResult = await callDesktopAgent(fnName, fc.args as Record<string, unknown>);
+
+                    // If it's a website or search action, also trigger browser tab opening on connected clients
+                    try {
+                      if (fnName === "openWebsite") {
+                        const siteMap: Record<string, string> = {
+                          youtube: "https://www.youtube.com",
+                          gmail: "https://mail.google.com",
+                          chatgpt: "https://chatgpt.com",
+                          openai: "https://chat.openai.com",
+                          google: "https://www.google.com",
+                          github: "https://github.com",
+                          reddit: "https://www.reddit.com",
+                          twitter: "https://x.com",
+                          x: "https://x.com",
+                          netflix: "https://www.netflix.com",
+                          spotify: "https://open.spotify.com",
+                        };
+                        const siteName = String((fc.args as any)?.name || "").toLowerCase().trim();
+                        let targetUrl = (fc.args as any)?.url || siteMap[siteName];
+                        if (!targetUrl && siteName) {
+                          targetUrl = siteName.includes("://") ? siteName : `https://${siteName}`;
+                        }
+                        if (targetUrl) {
+                          clientWs.send(JSON.stringify({ type: "client_action", action: "open_url", url: targetUrl, name: siteName || targetUrl }));
+                        }
+                      } else if (fnName === "searchYouTube") {
+                        const q = (fc.args as any)?.query || (fc.args as any)?.q || "";
+                        clientWs.send(JSON.stringify({ type: "client_action", action: "open_url", url: `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`, name: `YouTube: "${q}"` }));
+                      } else if (fnName === "playYouTubeVideo" || fnName === "selectYouTubeVideo") {
+                        const playUrl = (agentResult?.result as any)?.url || (fc.args as any)?.url || `https://www.youtube.com/results?search_query=${encodeURIComponent((fc.args as any)?.query || "music")}`;
+                        const title = (agentResult?.result as any)?.title || "YouTube Video";
+                        clientWs.send(JSON.stringify({ type: "client_action", action: "open_url", url: playUrl, name: title }));
+                      } else if (fnName === "searchGoogle" || fnName === "searchWeb") {
+                        const q = (fc.args as any)?.query || (fc.args as any)?.q || "";
+                        clientWs.send(JSON.stringify({ type: "client_action", action: "open_url", url: `https://www.google.com/search?q=${encodeURIComponent(q)}`, name: `Search: "${q}"` }));
+                      } else if (fnName === "openApplication") {
+                        const appName = (fc.args as any)?.name || "Application";
+                        clientWs.send(JSON.stringify({ type: "client_action", action: "tool_feedback", message: `Opening ${appName}...` }));
+                      }
+                    } catch (e) {
+                      /* best-effort client dispatch */
+                    }
 
                     // Broadcast tool execution to all connected clients for terminal display
                     const outputText = agentResult.ok
@@ -1735,7 +2155,25 @@ async function startServer() {
                     }
 
                     if (agentResult.ok) {
-                      const output = agentResult.result ?? { result: "Done." };
+                      let output: any = agentResult.result ?? { result: "Done." };
+
+                      // If tool captured a screen image (readScreen, takeScreenshot, analyzeScreenshot), stream frame to Gemini Live
+                      if (output && typeof output === "object" && output.image_base64) {
+                        try {
+                          const imgData = output.image_base64;
+                          const mime = output.image_mime || "image/jpeg";
+                          session.sendRealtimeInput({
+                            media: { data: imgData, mimeType: mime },
+                            video: { data: imgData, mimeType: mime }
+                          } as any);
+                        } catch (visErr) {
+                          console.error("[Desktop Agent] Error feeding screen capture to vision session:", visErr);
+                        }
+                        // Omit massive base64 string from text output for clean logging and prompt tokens
+                        const { image_base64, ...cleanOutput } = output;
+                        output = cleanOutput;
+                      }
+
                       session.sendToolResponse({
                         functionResponses: [{
                           name: fnName,
@@ -1792,8 +2230,70 @@ async function startServer() {
             });
           } else if (msg.type === "video" && msg.video) {
             session.sendRealtimeInput({
+              media: { data: msg.video, mimeType: "image/jpeg" },
               video: { data: msg.video, mimeType: "image/jpeg" }
+            } as any);
+          } else if (msg.type === "multimodal") {
+            const { text, file } = msg;
+            if (file) {
+              if (file.category === "image" && file.base64Data) {
+                // Send visual frame to multimodal live session
+                session.sendRealtimeInput({
+                  media: { data: file.base64Data, mimeType: file.mimeType || "image/jpeg" },
+                  video: { data: file.base64Data, mimeType: file.mimeType || "image/jpeg" }
+                } as any);
+
+                const promptText = `[User uploaded image/photo: "${file.name}"]\n${text ? `User message: ${text}` : "Please review and analyze this photo/image in detail and explain what you see."}`;
+                session.sendClientContent({
+                  turns: [{ role: "user", parts: [{ text: promptText }] }],
+                  turnComplete: true
+                });
+              } else if (file.category === "pdf") {
+                // If PDF has rendered page preview image, also send frame to live session
+                if (file.base64Data) {
+                  session.sendRealtimeInput({
+                    media: { data: file.base64Data, mimeType: "image/jpeg" },
+                    video: { data: file.base64Data, mimeType: "image/jpeg" }
+                  } as any);
+                }
+
+                const promptText = `[User shared PDF Document: "${file.name}" (${file.totalPages || 1} page(s), ${file.formattedSize || ''})]\n\n=== PDF CONTENT ===\n${file.textContent || '[No text extracted]'}\n=== END PDF CONTENT ===\n\n${text ? `User instructions: ${text}` : "Please review, summarize, and provide key insights from this PDF document."}`;
+                session.sendClientContent({
+                  turns: [{ role: "user", parts: [{ text: promptText }] }],
+                  turnComplete: true
+                });
+              } else {
+                // Text, code, document, csv, json, logs, etc.
+                const promptText = `[User shared document/code file: "${file.name}" (${file.formattedSize || ''})]\n\n\`\`\`\n${file.textContent || ''}\n\`\`\`\n\n${text ? `User instructions: ${text}` : "Please review and analyze this document, and provide your feedback or answer any related questions."}`;
+                session.sendClientContent({
+                  turns: [{ role: "user", parts: [{ text: promptText }] }],
+                  turnComplete: true
+                });
+              }
+            } else if (text) {
+              session.sendClientContent({
+                turns: [{ role: "user", parts: [{ text }] }],
+                turnComplete: true
+              });
+            }
+          } else if (msg.type === "text" && msg.text) {
+            session.sendClientContent({
+              turns: [
+                {
+                  role: "user",
+                  parts: [{ text: msg.text }]
+                }
+              ],
+              turnComplete: true
             });
+          } else if (msg.type === "speaker_verification") {
+            lastSpeakerBiometrics = {
+              isOwner: Boolean(msg.isOwner),
+              confidence: typeof msg.confidence === "number" ? msg.confidence : 0.9,
+              speakerType: msg.speakerType || (msg.isOwner ? "owner" : "guest"),
+              detectedPitch: typeof msg.detectedPitch === "number" ? msg.detectedPitch : 125,
+              ownerName: msg.ownerName || ownerName,
+            };
           } else if (msg.type === "toolResponse") {
             session.sendToolResponse({
               functionResponses: [
@@ -1828,11 +2328,33 @@ async function startServer() {
     }
   });
 
+  // Resolve correct production static distribution root
+  const potentialDistRoots = [
+    path.join(__dirname),
+    path.join(__dirname, "..", "dist"),
+    path.join(process.cwd(), "dist"),
+    path.join(process.cwd()),
+    path.join((process as any).resourcesPath || "", "app.asar", "dist"),
+    path.join((process as any).resourcesPath || "", "app", "dist"),
+  ];
+  let distPath = potentialDistRoots.find((p) => p && fs.existsSync(path.join(p, "index.html"))) || path.join(__dirname);
+
   // Serve custom static assets folder
-  app.use("/assets", express.static(path.join(process.cwd(), "assets")));
+  const potentialAssetRoots = [
+    path.join(distPath, "assets"),
+    path.join(__dirname, "..", "public", "assets"),
+    path.join(__dirname, "public", "assets"),
+    path.join(process.cwd(), "public", "assets"),
+    path.join(process.cwd(), "assets"),
+  ];
+  for (const ar of potentialAssetRoots) {
+    if (ar && fs.existsSync(ar)) {
+      app.use("/assets", express.static(ar));
+    }
+  }
 
   // Express Static assets / Vite Dev Middleware configuration
-  if (process.env.NODE_ENV !== "production") {
+  if (process.env.NODE_ENV !== "production" && !process.env.ELECTRON_PROD) {
     // Loaded lazily so the production bundle never requires vite (a dev-only
     // dependency that is not shipped with the packaged app).
     const { createServer: createViteServer } = await import("vite");
@@ -1842,15 +2364,20 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    console.log(`[Server] Serving production static bundle from: ${distPath}`);
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      const indexPath = path.join(distPath, "index.html");
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send("Akari UI index.html not found. Please verify build files.");
+      }
     });
   }
 
   server.listen(PORT, "0.0.0.0", async () => {
-    logStartup(`ELYSIA V2 server started on http://localhost:${PORT}`);
+    logStartup(`AKARI V2 server started on http://localhost:${PORT}`);
     console.log(`[Server] Running on http://localhost:${PORT}`);
     // Kick off the desktop agent (probe + auto-spawn) immediately on boot.
     ensureDesktopAgent().catch((e) =>

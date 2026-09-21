@@ -1,13 +1,17 @@
 /**
- * Audio handling utility for Elysia Live API Voice stream.
+ * Audio handling utility for Akari Live API Voice stream.
  * Handles:
  * - 16kHz layout sampling for microphone stream.
  * - Raw Little Endian Int16 PCM translation.
  * - 24kHz layout output sampling for model voice playback.
- * - Gapless double-buffer queue scheduler.
+ * - Gapless double-buffer queue scheduler with 40ms adaptive jitter cushion.
+ * - Persistent microphone stream with automatic reconnect to prevent mic drops.
  * - Interrupt signal immediate stop.
  * - Input & Output AnalyserNodes for real-time waveform visuals.
  */
+
+import { getVTubeStudioClient } from "./vtsClient";
+import { globalVoiceBiometrics, SpeakerIdentificationResult } from "./voiceBiometrics";
 
 export type LiveState = "disconnected" | "connecting" | "listening" | "speaking";
 
@@ -39,7 +43,7 @@ function pcm16ToFloats(uint8Array: Uint8Array): Float32Array {
 
 // Convert ArrayBuffer to Base64 String
 function base64ArrayBuffer(arrayBuffer: ArrayBuffer): string {
-  let binary = '';
+  let binary = "";
   const bytes = new Uint8Array(arrayBuffer);
   const len = bytes.byteLength;
   for (let i = 0; i < len; i++) {
@@ -59,27 +63,27 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
-export class ElysiaAudioSession {
+export class AkariAudioSession {
   private ws: WebSocket | null = null;
-  
-  // Audios contexts (separate to match exact required sample rates)
+
+  // Audio contexts (separate to match exact required sample rates)
   private inputAudioCtx: AudioContext | null = null;
   private outputAudioCtx: AudioContext | null = null;
-  
+
   // Audio sources & processors
   private micStream: MediaStream | null = null;
   private micSourceNode: MediaStreamAudioSourceNode | null = null;
   private micProcessorNode: ScriptProcessorNode | null = null;
-  
+
   // Visualisers
   public inputAnalyser: AnalyserNode | null = null;
   public outputAnalyser: AnalyserNode | null = null;
   private outputGainNode: GainNode | null = null;
-  
+
   // Buffering / Playback details
   private nextStartTime = 0;
   private activeSources: AudioBufferSourceNode[] = [];
-  
+
   // State Callbacks
   private onStateChange: (state: LiveState) => void;
   private onTranscription: (role: "user" | "model", text: string) => void;
@@ -88,30 +92,23 @@ export class ElysiaAudioSession {
   private onMemorySync?: (memories: any[]) => void;
   private onReminder?: (text: string, id: string) => void;
   private onTerminalOutput?: (tool: string, args: any, output: string) => void;
-  
+  private onClientAction?: (action: string, payload: any) => void;
+  private onSpeakerChange?: (result: SpeakerIdentificationResult) => void;
+
   private currentState: LiveState = "disconnected";
   private isActivated = false;
-  private isPttActive = false;
+  private isReconnecting = false;
+  private reconnectTimeout: any = null;
+  private speechEndTimer: any = null;
+  private lastSpeakerBroadcastTime = 0;
 
-  private handleKeyDown = (e: KeyboardEvent) => {
-    if (e.code === "Space" && !e.repeat) {
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
-      this.isPttActive = true;
-      if (this.micStream && this.micStream.getAudioTracks().length > 0) {
-        this.micStream.getAudioTracks()[0].enabled = true;
-      }
-    }
-  };
+  // Saved connection parameters for seamless auto-reconnect
+  private lastVoice?: string;
+  private lastAvatarStyle?: "character" | "orb" | "vts" | "jrsidd" | string;
+  private lastOwnerName?: string;
+  private lastSpeakerRecognition?: boolean;
 
-  private handleKeyUp = (e: KeyboardEvent) => {
-    if (e.code === "Space") {
-      this.isPttActive = false;
-      if (this.micStream && this.micStream.getAudioTracks().length > 0) {
-        this.micStream.getAudioTracks()[0].enabled = false;
-      }
-    }
-  };
+  private vtsSyncInterval: any = null;
 
   constructor(handlers: {
     onStateChange: (state: LiveState) => void;
@@ -121,6 +118,8 @@ export class ElysiaAudioSession {
     onMemorySync?: (memories: any[]) => void;
     onReminder?: (text: string, id: string) => void;
     onTerminalOutput?: (tool: string, args: any, output: string) => void;
+    onClientAction?: (action: string, payload: any) => void;
+    onSpeakerChange?: (result: SpeakerIdentificationResult) => void;
   }) {
     this.onStateChange = handlers.onStateChange;
     this.onTranscription = handlers.onTranscription;
@@ -129,6 +128,8 @@ export class ElysiaAudioSession {
     this.onMemorySync = handlers.onMemorySync;
     this.onReminder = handlers.onReminder;
     this.onTerminalOutput = handlers.onTerminalOutput;
+    this.onClientAction = handlers.onClientAction;
+    this.onSpeakerChange = handlers.onSpeakerChange;
   }
 
   private setState(state: LiveState) {
@@ -150,308 +151,419 @@ export class ElysiaAudioSession {
   }
 
   // Requests microphone and creates connections
-  public async connect(voice?: string, avatarStyle?: "character" | "orb") {
+  public async connect(
+    voice?: string,
+    avatarStyle?: "character" | "orb" | "vts" | "jrsidd" | string,
+    ownerName?: string,
+    speakerRecognition?: boolean
+  ) {
     if (this.isActivated) return;
     this.isActivated = true;
+    this.isReconnecting = false;
+
+    this.lastVoice = voice;
+    this.lastAvatarStyle = avatarStyle;
+    this.lastOwnerName = ownerName;
+    this.lastSpeakerRecognition = speakerRecognition;
+
     this.setState("connecting");
+    await this.initAudioAndWebSocket();
+  }
 
+  private async initAudioAndWebSocket() {
     try {
-      // 1. Establish custom WebSocket server bridge
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      
-      const params = new URLSearchParams();
-      if (voice) params.set("voice", voice);
-      if (avatarStyle) params.set("avatarStyle", avatarStyle);
-      const queryStr = params.toString() ? `?${params.toString()}` : "";
-      
-      this.ws = new WebSocket(`${protocol}//${window.location.host}/live${queryStr}`);
-      this.ws.binaryType = "blob";
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) {
+        throw new Error("Web Audio API missing in browser.");
+      }
 
-      this.ws.onopen = async () => {
-        console.log("[Elysia] Connected to server side WS bridge");
-        try {
-          // Guard against early user disconnect during connection setup
-          if (!this.isActivated) return;
+      // Initialize or resume AudioContexts
+      if (!this.inputAudioCtx || this.inputAudioCtx.state === "closed") {
+        this.inputAudioCtx = new AudioContextClass({ sampleRate: 16000 });
+      }
+      if (!this.outputAudioCtx || this.outputAudioCtx.state === "closed") {
+        this.outputAudioCtx = new AudioContextClass({ sampleRate: 24000 });
+      }
 
-          // Safe, cross-browser AudioContext initialization
-          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-          if (!AudioContextClass) {
-            throw new Error("Holographic audio link unsupported: Web Audio API missing in browser.");
+      if (this.inputAudioCtx.state === "suspended") {
+        await this.inputAudioCtx.resume().catch(() => {});
+      }
+      if (this.outputAudioCtx.state === "suspended") {
+        await this.outputAudioCtx.resume().catch(() => {});
+      }
+
+      // Setup output analyser & gain
+      if (!this.outputGainNode) {
+        this.outputGainNode = this.outputAudioCtx.createGain();
+        this.outputAnalyser = this.outputAudioCtx.createAnalyser();
+        this.outputAnalyser.fftSize = 256;
+        this.outputAnalyser.smoothingTimeConstant = 0.3;
+        this.outputGainNode.connect(this.outputAnalyser);
+        this.outputAnalyser.connect(this.outputAudioCtx.destination);
+      }
+
+      // Obtain or reuse user microphone stream
+      if (!this.micStream || this.micStream.getAudioTracks().every((t) => t.readyState === "ended")) {
+        this.micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      }
+
+      // Ensure all tracks are enabled
+      this.micStream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+
+      if (!this.isActivated) {
+        this.micStream.getTracks().forEach((track) => {
+          try {
+            track.stop();
+          } catch (e) {}
+        });
+        return;
+      }
+
+      // Setup input analyser
+      if (!this.inputAnalyser) {
+        this.inputAnalyser = this.inputAudioCtx.createAnalyser();
+        this.inputAnalyser.fftSize = 256;
+        this.inputAnalyser.smoothingTimeConstant = 0.3;
+      }
+
+      if (!this.micSourceNode) {
+        this.micSourceNode = this.inputAudioCtx.createMediaStreamSource(this.micStream);
+        this.micSourceNode.connect(this.inputAnalyser);
+      }
+
+      // Setup mic processor node (512 buffer = ~32ms latency)
+      if (!this.micProcessorNode) {
+        this.micProcessorNode = this.inputAudioCtx.createScriptProcessor(512, 1, 1);
+        this.micSourceNode.connect(this.micProcessorNode);
+        this.micProcessorNode.connect(this.inputAudioCtx.destination);
+      }
+
+      this.micProcessorNode.onaudioprocess = (e) => {
+        if (this.currentState === "disconnected" || this.currentState === "connecting") return;
+
+        const channelData = e.inputBuffer.getChannelData(0);
+        const pcmBuffer = floatTo16BitPCM(channelData);
+        const base64 = base64ArrayBuffer(pcmBuffer);
+
+        // Run live acoustic voice biometrics & adaptive speaker learning
+        const bioResult = globalVoiceBiometrics.processAudioFrame(channelData, 16000);
+        if (this.onSpeakerChange && bioResult.speakerType !== "ambient") {
+          this.onSpeakerChange(bioResult);
+        }
+
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ audio: base64 }));
+
+          // Broadcast speaker verification state periodically during active speech
+          const now = Date.now();
+          if (now - this.lastSpeakerBroadcastTime > 1500 && bioResult.speakerType !== "ambient") {
+            this.lastSpeakerBroadcastTime = now;
+            this.ws.send(JSON.stringify({
+              type: "speaker_verification",
+              isOwner: bioResult.isOwner,
+              confidence: bioResult.confidence,
+              speakerType: bioResult.speakerType,
+              detectedPitch: bioResult.detectedPitch,
+              ownerName: this.lastOwnerName || "Siddhant"
+            }));
           }
-
-          this.inputAudioCtx = new AudioContextClass({ sampleRate: 16000 });
-          this.outputAudioCtx = new AudioContextClass({ sampleRate: 24000 });
-
-          // Ensure Audio Contexts are active and resumed to bypass browser security blocks
-          if (this.inputAudioCtx.state === "suspended") {
-            await this.inputAudioCtx.resume().catch(() => {});
-          }
-          if (this.outputAudioCtx.state === "suspended") {
-            await this.outputAudioCtx.resume().catch(() => {});
-          }
-          
-          // Setup custom output Analyser & Volume Gains
-          this.outputGainNode = this.outputAudioCtx.createGain();
-          this.outputAnalyser = this.outputAudioCtx.createAnalyser();
-          this.outputAnalyser.fftSize = 256;
-          this.outputAnalyser.smoothingTimeConstant = 0.8;
-          
-          this.outputGainNode.connect(this.outputAnalyser);
-          this.outputAnalyser.connect(this.outputAudioCtx.destination);
-          
-          // Obtain User Microphone layout
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            }
-          });
-
-          // Safeguard: Check if we disconnected while waiting for user to grant mic permissions
-          if (!this.isActivated || !this.inputAudioCtx || !this.outputAudioCtx) {
-            stream.getTracks().forEach((track) => {
-              try {
-                track.stop();
-              } catch (e) {}
-            });
-            return;
-          }
-
-          this.micStream = stream;
-          
-          // Microphone remains continuously active
-
-          // Setup custom input Analyser
-          this.inputAnalyser = this.inputAudioCtx.createAnalyser();
-          this.inputAnalyser.fftSize = 256;
-          
-          this.micSourceNode = this.inputAudioCtx.createMediaStreamSource(this.micStream);
-          this.micSourceNode.connect(this.inputAnalyser);
-
-          // Stream input PCM 16-bit to WS
-          this.micProcessorNode = this.inputAudioCtx.createScriptProcessor(2048, 1, 1);
-          this.micSourceNode.connect(this.micProcessorNode);
-          this.micProcessorNode.connect(this.inputAudioCtx.destination);
-
-          this.micProcessorNode.onaudioprocess = (e) => {
-            if (this.currentState === "disconnected" || this.currentState === "connecting") return;
-            
-            const channelData = e.inputBuffer.getChannelData(0);
-            
-            // Convert to base64 Int16 Little Endian PCM
-            const pcmBuffer = floatTo16BitPCM(channelData);
-            const base64 = base64ArrayBuffer(pcmBuffer);
-            
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-              this.ws.send(JSON.stringify({ audio: base64 }));
-            }
-          };
-
-          // Sound setups are fully functional
-          this.setState("listening");
-
-        } catch (audioError: any) {
-          console.error("Audio Context or Microphone Initialization Failed:", audioError);
-          this.onError(`Permission error: ${audioError.message || "Microphone required for holographic Live link."}`);
-          this.disconnect();
         }
       };
 
-      this.ws.onmessage = async (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          
-          // Root Error Handler message
-          if (data.type === "error") {
-            this.onError(data.error);
-            this.disconnect();
-            return;
-          }
-          
-          // Shutdown Handler message
-          if (data.type === "shutdown") {
-            window.close();
-            this.disconnect();
-            return;
-          }
-
-          // Handle server-side states
-          if (data.type === "status") {
-            console.log("[Elysia WS Status]:", data.status);
-            if (data.status === "connecting_gemini") {
-              // Wait for Gemini Live connection
-            } else if (data.status === "connected") {
-              this.setState("listening");
-            } else if (data.status === "session_closed") {
-              this.disconnect();
-            }
-            return;
-          }
-
-          // Handle audio payload (24kHzPCM model response)
-          if (data.type === "audio" && data.audio) {
-            this.playAudioPCMChunk(data.audio);
-          }
-
-          // Handle interruption signal (e.g. user talked over Elysia)
-          if (data.type === "interrupted") {
-            this.handleInterruption();
-          }
-
-          // Turn complete
-          if (data.type === "turnComplete") {
-            // Once Elysia completes speaking, change visual state back to listening
-            setTimeout(() => {
-              if (this.activeSources.length === 0 && this.currentState === "speaking") {
-                this.setState("listening");
-              }
-            }, 100);
-          }
-
-          // Handle live captions transcription
-          if (data.type === "transcription") {
-            this.onTranscription(data.role, data.text);
-          }
-
-          // Handle memory synchronization
-          if (data.type === "memory_sync" && data.memories) {
-            if (this.onMemorySync) {
-              this.onMemorySync(data.memories);
-            }
-          }
-
-          // Handle reminder notifications
-          if (data.type === "reminder" && data.text) {
-            if (this.onReminder) {
-              this.onReminder(data.text, data.id || "");
-            }
-          }
-
-          // Handle terminal output (tool execution results)
-          if (data.type === "terminal_output" && data.output) {
-            if (this.onTerminalOutput) {
-              this.onTerminalOutput(data.tool, data.args, data.output);
-            }
-          }
-
-          // Handle Tool Calling
-          if (data.type === "toolCall") {
-            const { callId, name, args } = data;
-            this.onToolCall(name, args, (result) => {
-              // Send back execution result to server bridge
-              if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({
-                  type: "toolResponse",
-                  id: callId,
-                  name: name,
-                  output: result
-                }));
-              }
-            });
-          }
-
-        } catch (parseError) {
-          console.error("Error reading server packet:", parseError);
-        }
-      };
-
-      this.ws.onerror = (wsError) => {
-        console.error("WebSocket transport error:", wsError);
-        this.onError("Holographic network link lost. Please check connection.");
-        this.disconnect();
-      };
-
-      this.ws.onclose = () => {
-        console.log("WebSocket connection closed");
-        this.disconnect();
-      };
-
-    } catch (e: any) {
-      console.error("Connection establish sequence failed:", e);
-      this.onError(e.message || "Failed to initialize active channel.");
+      // Connect WebSocket
+      this.connectWebSocket();
+      this.startVtsSync();
+    } catch (audioError: any) {
+      console.error("[Akari Audio] Audio Context or Microphone Initialization Failed:", audioError);
+      this.onError(`Permission error: ${audioError.message || "Microphone required for live link."}`);
       this.disconnect();
     }
   }
 
-  // Interruption triggers: stops all active audio players immediately
+  private connectWebSocket() {
+    if (this.ws) {
+      try {
+        this.ws.onclose = null;
+        this.ws.onerror = null;
+        this.ws.close();
+      } catch (e) {}
+      this.ws = null;
+    }
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams();
+    if (this.lastVoice) params.set("voice", this.lastVoice);
+    if (this.lastAvatarStyle) params.set("avatarStyle", this.lastAvatarStyle);
+    if (this.lastOwnerName) params.set("ownerName", this.lastOwnerName);
+    if (this.lastSpeakerRecognition !== undefined) params.set("speakerRecognition", String(this.lastSpeakerRecognition));
+    const queryStr = params.toString() ? `?${params.toString()}` : "";
+
+    this.ws = new WebSocket(`${protocol}//${window.location.host}/live${queryStr}`);
+    this.ws.binaryType = "blob";
+
+    this.ws.onopen = () => {
+      console.log("[Akari Audio] Connected to WebSocket bridge on /live");
+      this.isReconnecting = false;
+      this.setState("listening");
+    };
+
+    this.ws.onmessage = async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "error") {
+          console.warn("[Akari WS Server Error]:", data.error);
+          this.onError(data.error);
+          return;
+        }
+
+        if (data.type === "shutdown") {
+          window.close();
+          this.disconnect();
+          return;
+        }
+
+        if (data.type === "status") {
+          console.log("[Akari WS Status]:", data.status);
+          if (data.status === "connected") {
+            this.setState("listening");
+          } else if (data.status === "session_closed") {
+            // Auto-reconnect smoothly instead of killing mic
+            this.triggerAutoReconnect();
+          }
+          return;
+        }
+
+        // Handle audio payload (24kHz PCM model response)
+        if (data.type === "audio" && data.audio) {
+          this.playAudioPCMChunk(data.audio);
+        }
+
+        // Interruption signal
+        if (data.type === "interrupted") {
+          this.handleInterruption();
+        }
+
+        // Turn complete
+        if (data.type === "turnComplete") {
+          setTimeout(() => {
+            if (this.activeSources.length === 0 && this.currentState === "speaking") {
+              this.setState("listening");
+            }
+          }, 50);
+        }
+
+        // Transcriptions
+        if (data.type === "transcription") {
+          this.onTranscription(data.role, data.text);
+        }
+
+        // Memory sync
+        if (data.type === "memory_sync" && data.memories) {
+          if (this.onMemorySync) {
+            this.onMemorySync(data.memories);
+          }
+        }
+
+        // Reminder notifications
+        if (data.type === "reminder" && data.text) {
+          if (this.onReminder) {
+            this.onReminder(data.text, data.id || "");
+          }
+        }
+
+        // Terminal output logs
+        if (data.type === "terminal_output" && data.output) {
+          if (this.onTerminalOutput) {
+            this.onTerminalOutput(data.tool, data.args, data.output);
+          }
+        }
+
+        // Client actions
+        if (data.type === "client_action" && data.action) {
+          if (this.onClientAction) {
+            this.onClientAction(data.action, data);
+          }
+        }
+
+        // Tool calls
+        if (data.type === "toolCall") {
+          const { callId, name, args } = data;
+          this.onToolCall(name, args, (result) => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(JSON.stringify({
+                type: "toolResponse",
+                id: callId,
+                name: name,
+                output: result,
+              }));
+            }
+          });
+        }
+      } catch (parseError) {
+        console.error("Failed to parse incoming WS message:", parseError);
+      }
+    };
+
+    this.ws.onclose = () => {
+      console.log("[Akari Audio] WS connection closed.");
+      if (this.isActivated) {
+        this.triggerAutoReconnect();
+      }
+    };
+
+    this.ws.onerror = (err) => {
+      console.warn("[Akari Audio] WS socket error:", err);
+      if (this.isActivated) {
+        this.triggerAutoReconnect();
+      }
+    };
+  }
+
+  private triggerAutoReconnect() {
+    if (!this.isActivated || this.isReconnecting) return;
+    this.isReconnecting = true;
+    this.setState("connecting");
+
+    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+    this.reconnectTimeout = setTimeout(async () => {
+      if (!this.isActivated) return;
+      console.log("[Akari Audio] 🔄 Auto-reconnecting to maintain persistent microphone stream...");
+      try {
+        if (this.inputAudioCtx && this.inputAudioCtx.state === "suspended") {
+          await this.inputAudioCtx.resume().catch(() => {});
+        }
+        if (this.outputAudioCtx && this.outputAudioCtx.state === "suspended") {
+          await this.outputAudioCtx.resume().catch(() => {});
+        }
+        this.connectWebSocket();
+      } catch (err) {
+        console.warn("[Akari Audio] Reconnect failed, retrying in 2s:", err);
+        this.isReconnecting = false;
+        if (this.isActivated) {
+          this.reconnectTimeout = setTimeout(() => this.triggerAutoReconnect(), 2000);
+        }
+      }
+    }, 1000);
+  }
+
+  // Interruption handling (stops audio queue instantly)
   private handleInterruption() {
-    console.log("[Audio] Interruption signal received; flushing play logs.");
-    
-    // Stop all playing nodes
+    if (this.speechEndTimer) {
+      clearTimeout(this.speechEndTimer);
+      this.speechEndTimer = null;
+    }
     this.activeSources.forEach((source) => {
       try {
         source.stop();
-      } catch (err) {
-        // Already finished or stopped
-      }
+      } catch (err) {}
     });
     this.activeSources = [];
     this.nextStartTime = 0;
-    
-    // Set state back to user listening
     this.setState("listening");
   }
 
-  // Direct raw PCM chunk scheduled playback at 24kHz
+  // Jitter-buffered raw PCM chunk scheduled playback at 24kHz
   private playAudioPCMChunk(base64Audio: string) {
     if (!this.outputAudioCtx || !this.outputGainNode) return;
 
     try {
-      this.setState("speaking");
+      if (this.outputAudioCtx.state === "suspended") {
+        this.outputAudioCtx.resume().catch(() => {});
+      }
+
+      if (this.speechEndTimer) {
+        clearTimeout(this.speechEndTimer);
+        this.speechEndTimer = null;
+      }
+
+      if (this.currentState !== "speaking") {
+        this.setState("speaking");
+      }
+
       const uint8Array = base64ToUint8Array(base64Audio);
       const floats = pcm16ToFloats(uint8Array);
 
-      // Create AudioBuffer of 24000Hz (the exact playback sample rate of Gemini outputs)
       const buffer = this.outputAudioCtx.createBuffer(1, floats.length, 24000);
       buffer.getChannelData(0).set(floats);
 
-      // Create Buffer source
       const source = this.outputAudioCtx.createBufferSource();
       source.buffer = buffer;
-
-      // Connect source to gain which is routed to analyser & speakers
       source.connect(this.outputGainNode);
 
       const currentTime = this.outputAudioCtx.currentTime;
-      
-      // Gapless scheduler sync
+
+      // Adaptive 40ms safety cushion to prevent voice breaks
       if (this.nextStartTime < currentTime) {
-        // Start fresh: 30ms ahead to bridge schedule timing
-        this.nextStartTime = currentTime + 0.03;
+        this.nextStartTime = currentTime + 0.040;
       }
 
       source.start(this.nextStartTime);
       this.nextStartTime += buffer.duration;
 
-      // Keep reference to handle real-time interruptions
       source.onended = () => {
         const index = this.activeSources.indexOf(source);
         if (index > -1) {
           this.activeSources.splice(index, 1);
         }
-        
-        // If there are no more active play nodes, revert state back to listening
-        if (this.activeSources.length === 0 && this.currentState === "speaking") {
-          this.setState("listening");
+
+        if (this.activeSources.length === 0) {
+          if (this.speechEndTimer) clearTimeout(this.speechEndTimer);
+          this.speechEndTimer = setTimeout(() => {
+            if (this.activeSources.length === 0 && this.currentState === "speaking") {
+              this.setState("listening");
+            }
+          }, 180);
         }
       };
 
       this.activeSources.push(source);
-
     } catch (playbackError) {
-      console.error("PCM Chunk buffering/playback failed:", playbackError);
+      console.error("[Akari Audio] PCM Chunk playback failed:", playbackError);
     }
   }
 
-  // Fully cleanup and release microphones & connection sockets
+  // Send text message or multimodal attachment over WebSocket to Gemini
+  public sendTextMessage(text: string, file?: any): boolean {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (file) {
+        this.ws.send(JSON.stringify({ type: "multimodal", text, file }));
+      } else {
+        this.ws.send(JSON.stringify({ type: "text", text }));
+      }
+      return true;
+    }
+    return false;
+  }
+
   public disconnect() {
     this.isActivated = false;
+    this.isReconnecting = false;
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    if (this.speechEndTimer) {
+      clearTimeout(this.speechEndTimer);
+      this.speechEndTimer = null;
+    }
+
     this.setState("disconnected");
+    this.stopVtsSync();
 
     // Close WS socket
     if (this.ws) {
       try {
+        this.ws.onclose = null;
+        this.ws.onerror = null;
         this.ws.close();
       } catch (e) {}
       this.ws = null;
@@ -496,14 +608,54 @@ export class ElysiaAudioSession {
       } catch (e) {}
       this.outputAudioCtx = null;
     }
-    
-    window.removeEventListener("keydown", this.handleKeyDown);
-    window.removeEventListener("keyup", this.handleKeyUp);
 
     this.activeSources = [];
     this.nextStartTime = 0;
     this.inputAnalyser = null;
     this.outputAnalyser = null;
     this.outputGainNode = null;
+  }
+
+  private startVtsSync() {
+    this.stopVtsSync();
+    const dataArray = new Uint8Array(64);
+
+    this.vtsSyncInterval = setInterval(() => {
+      if (this.currentState === "disconnected") return;
+
+      let amplitude = 0;
+      if (this.currentState === "speaking" && this.outputAnalyser) {
+        try {
+          this.outputAnalyser.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          amplitude = (sum / dataArray.length) / 255;
+        } catch {}
+      } else if (this.currentState === "listening" && this.inputAnalyser) {
+        try {
+          this.inputAnalyser.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          amplitude = (sum / dataArray.length) / 255;
+        } catch {}
+      }
+
+      getVTubeStudioClient().setAudioAmplitude(
+        amplitude,
+        this.currentState === "speaking",
+        this.currentState === "listening"
+      );
+    }, 16);
+  }
+
+  private stopVtsSync() {
+    if (this.vtsSyncInterval) {
+      clearInterval(this.vtsSyncInterval);
+      this.vtsSyncInterval = null;
+    }
   }
 }

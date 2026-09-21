@@ -240,8 +240,8 @@ def _cancel(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"result": "Cancelled pending shutdown/restart timer."}
 
 
-@register("shutdownElysia")
-def shutdown_elysia(args: Dict[str, Any]) -> Dict[str, Any]:
+@register("shutdownAkari")
+def shutdown_akari(args: Dict[str, Any]) -> Dict[str, Any]:
     import os
     import signal
     import sys
@@ -252,7 +252,7 @@ def shutdown_elysia(args: Dict[str, Any]) -> Dict[str, Any]:
         sys.exit(0)
     import threading
     threading.Thread(target=_shutdown, daemon=True).start()
-    return {"result": "ELYSIA is shutting down. Goodbye!"}
+    return {"result": "AKARI is shutting down. Goodbye!"}
 
 
 __all__ = [
@@ -264,5 +264,5 @@ __all__ = [
     "request_power_action",
     "execute_power_action",
     "_cancel_power_timer",
-    "shutdown_elysia",
+    "shutdown_akari",
 ]

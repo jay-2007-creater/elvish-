@@ -90,7 +90,7 @@ def _ensure_safe(p: Path, allow_anywhere: bool = False) -> None:
         if real == root_real or real.startswith(root_real + os.sep):
             return
     raise ToolError(
-        f"Path '{p}' is outside ELYSIA's safe folders (Desktop, Documents, "
+        f"Path '{p}' is outside AKARI's safe folders (Desktop, Documents, "
         f"Downloads, Pictures, Music, Videos, home, and the project folder). "
         f"Pass allow_anywhere=true only if you really mean it."
     )
@@ -206,6 +206,79 @@ def open_folder(args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         subprocess.Popen(["xdg-open", str(folder)], close_fds=True)
     return {"result": f"Opened folder: {folder}", "path": str(folder)}
+
+
+@register("openFile")
+def open_file(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Open any document, file, image, PDF, presentation, or spreadsheet with its default system app.
+    Intelligently searches Desktop, Downloads, Documents, and project directory if full path not given.
+    """
+    file_query: Optional[str] = args.get("path") or args.get("filename") or args.get("name")
+    reveal = bool(args.get("reveal", False))
+
+    if not file_query or not file_query.strip():
+        raise ToolError("Please specify a filename or path to open.")
+
+    query = file_query.strip()
+    p = Path(os.path.expanduser(query))
+
+    target_file: Optional[Path] = None
+
+    if p.is_absolute() and p.exists():
+        target_file = p
+    else:
+        search_folders = [
+            HOME / "Desktop",
+            HOME / "Downloads",
+            HOME / "Documents",
+            Path.cwd(),
+            HOME,
+        ]
+
+        # 1. Exact match
+        for folder in search_folders:
+            if not folder.exists():
+                continue
+            cand = folder / query
+            if cand.exists() and cand.is_file():
+                target_file = cand
+                break
+
+        # 2. Case-insensitive search & extension matches
+        if not target_file:
+            clean_q = query.lower()
+            for folder in search_folders:
+                if not folder.exists():
+                    continue
+                try:
+                    for cand in folder.iterdir():
+                        if cand.is_file() and not cand.name.startswith("~$") and not cand.name.startswith(".~") and (cand.name.lower() == clean_q or cand.stem.lower() == clean_q or clean_q in cand.name.lower()):
+                            target_file = cand
+                            break
+                except Exception:
+                    pass
+                if target_file:
+                    break
+
+    if not target_file or not target_file.exists():
+        raise ToolError(f"Could not find file matching '{query}'.")
+
+    try:
+        if reveal and platform.system() == "Windows":
+            subprocess.Popen(f'explorer /select,"{target_file}"', shell=True, close_fds=True)
+            return {"result": f"Revealed '{target_file.name}' in File Explorer.", "path": str(target_file)}
+
+        if platform.system() == "Windows":
+            os.startfile(str(target_file))
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", str(target_file)], close_fds=True)
+        else:
+            subprocess.Popen(["xdg-open", str(target_file)], close_fds=True)
+
+        return {"result": f"Opened file '{target_file.name}' from {target_file.parent}.", "path": str(target_file)}
+    except Exception as e:
+        raise ToolError(f"Failed to open file '{target_file}': {e}")
 
 
 @register("listFiles")

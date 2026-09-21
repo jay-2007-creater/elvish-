@@ -1,9 +1,9 @@
 """
-Windows auto-start management for ELYSIA (V2).
+Windows auto-start management for AKARI (V2).
 
 Manages a single registry entry under
-    HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Elysia
-which points at the silent launcher batch file (start-elysia-silent.bat) located
+    HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Akari
+which points at the silent launcher batch file (start-akari-silent.bat) located
 in the project root. HKCU is used (no admin rights required) and the change is
 per-user.
 
@@ -25,8 +25,8 @@ from typing import Any, Dict
 from ..registry import ToolError, register
 
 RUN_KEY_PATH = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-VALUE_NAME = "Elysia"
-SILENT_LAUNCHER = "start-elysia-silent.bat"
+VALUE_NAME = "Akari"
+SILENT_LAUNCHER = "start-akari-silent.bat"
 
 
 def _project_root() -> str:
@@ -41,7 +41,7 @@ def _launcher_path() -> str:
 
 def _ensure_launcher_exists() -> str:
     """
-    Make sure start-elysia-silent.bat exists in the project root.
+    Make sure start-akari-silent.bat exists in the project root.
     If missing, write a minimal silent launcher so auto-start never breaks.
     """
     path = _launcher_path()
@@ -62,18 +62,15 @@ def _ensure_launcher_exists() -> str:
             f'set "PYTHON_EXE={py}"',
             "cd /d \"%PROJECT_DIR%\"",
             (
-                'start "" /B "%PYTHON_EXE%" -m uvicorn agent.server:app '
-                '--host 127.0.0.1 --port 8765'
+                'start "" /B "%PYTHON_EXE%" run_agent.py'
             ),
-            "timeout /t 3 /nobreak >nul",
+            "timeout /t 2 /nobreak >nul",
             "start \"\" /B npm run dev",
-            "timeout /t 6 /nobreak >nul",
-            'start "" "http://localhost:3000"',
             "",
         ]
     )
     try:
-        with open(path, "w", encoding="utf-8", newline="\\r\\n") as fh:
+        with open(path, "w", encoding="utf-8", newline="\r\n") as fh:
             fh.write(body)
     except OSError as e:  # pragma: no cover - filesystem error
         raise ToolError(f"Could not create silent launcher: {e}") from e
@@ -140,7 +137,7 @@ def enable_auto_start(args: Dict[str, Any]) -> Dict[str, Any]:
         raise ToolError(f"Could not write startup registry entry: {e}") from e
 
     return {
-        "result": "Auto-start enabled. Elysia will launch silently on next Windows login.",
+        "result": "Auto-start enabled. Akari will launch silently on next Windows login.",
         "enabled": True,
         "launcher": launcher,
         "registry_key": f"HKCU\\{RUN_KEY_PATH}\\{VALUE_NAME}",
@@ -163,12 +160,22 @@ def disable_auto_start(args: Dict[str, Any]) -> Dict[str, Any]:
         ) as key:
             winreg.DeleteValue(key, VALUE_NAME)
     except FileNotFoundError:
-        return {"result": "Auto-start was already disabled.", "enabled": False}
+        pass
     except OSError as e:
         raise ToolError(f"Could not remove startup registry entry: {e}") from e
 
+    # Also clean up Startup folder shortcut if present
+    try:
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            startup_lnk = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Akari AI.lnk")
+            if os.path.exists(startup_lnk):
+                os.remove(startup_lnk)
+    except Exception:
+        pass
+
     return {
-        "result": "Auto-start disabled. Elysia will no longer launch on login.",
+        "result": "Auto-start disabled. Akari will no longer launch on login.",
         "enabled": False,
     }
 
@@ -182,7 +189,7 @@ def get_auto_start_status(args: Dict[str, Any]) -> Dict[str, Any]:
     enabled = value is not None
     return {
         "result": (
-            "Auto-start is ENABLED. Elysia launches on Windows login."
+            "Auto-start is ENABLED. Akari launches on Windows login."
             if enabled
             else "Auto-start is DISABLED."
         ),

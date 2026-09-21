@@ -1,5 +1,5 @@
 """
-ELYSIA Desktop Control Agent — Central tool registry.
+AKARI Desktop Control Agent — Central tool registry.
 
 Each tool module registers handlers into a flat dict `TOOLS` mapping
 tool_name -> callable(args: dict) -> dict.
@@ -74,15 +74,18 @@ def register(name: str):
     return deco
 
 
-# The set of all tool names ELYSIA may route to this agent.
+# The set of all tool names AKARI may route to this agent.
 # Kept in sync with the functionDeclarations added in server.ts.
 DESKTOP_TOOL_NAMES = [
-    # applications / websites / search
+    # applications / websites / search / youtube
     "openApplication",
     "closeApplication",
     "openWebsite",
     "searchWeb",
     "searchYouTube",
+    "playYouTubeVideo",
+    "selectYouTubeVideo",
+    "youtubeControl",
     "searchGoogle",
     "searchGitHub",
     # files
@@ -92,6 +95,7 @@ DESKTOP_TOOL_NAMES = [
     "deleteFile",
     "moveFile",
     "openFolder",
+    "openFile",
     "listFiles",
     "searchFiles",
     # pc control (volume + gated power)
@@ -163,7 +167,7 @@ DESKTOP_TOOL_NAMES = [
     "iitmOpen",
     "iitmOpenCustom",
     # self-close
-    "shutdownElysia",
+    "shutdownAkari",
     # weather
     "getWeather",
     # OS input
@@ -190,6 +194,14 @@ DESKTOP_TOOL_NAMES = [
     "cameraList",
     "cameraOn",
     "cameraOff",
+    # PowerPoint & presentation generation
+    "createPresentation",
+    "openPowerPoint",
+    "readPresentation",
+    "addSlideToPresentation",
+    # Office Suite (Excel & Word documents)
+    "createExcelSpreadsheet",
+    "createDocument",
 ]
 
 
@@ -220,6 +232,8 @@ _MODULE_NAMES = [
     "tools.os_input",
     "tools.google",
     "tools.camera",
+    "tools.powerpoint",
+    "tools.office",
 ]
 
 
@@ -246,6 +260,9 @@ def load_all() -> None:
     import agent.tools.os_input
     import agent.tools.google
     import agent.tools.camera
+    import agent.tools.powerpoint
+    import agent.tools.office
 
 
 __all__ = ["TOOLS", "STATE", "DESKTOP_TOOL_NAMES", "ToolError", "register", "load_all"]
+
