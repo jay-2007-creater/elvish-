@@ -1,6 +1,6 @@
 # Contributing to AKARI
 
-Thanks for your interest! This is a personal project by **Sarang (SarangRao20)**, but contributions and suggestions are welcome.
+Thanks for your interest! This is a personal project by **jay-2007-creater**, but contributions and suggestions are welcome.
 
 ## How to Contribute
 
@@ -31,7 +31,7 @@ Thanks for your interest! This is a personal project by **Sarang (SarangRao20)**
 
 ## Reporting Issues
 
-Open an issue at [github.com/SarangRao20/Akari-AI/issues](https://github.com/SarangRao20/Akari-AI/issues) with:
+Open an issue at [github.com/jay-2007-creater/jarvesa-/issues](https://github.com/jay-2007-creater/jarvesa-/issues) with:
 - What you were doing
 - What happened vs what you expected
 - Relevant logs (check browser console + `agent/server.py` output)

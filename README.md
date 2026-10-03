@@ -1,7 +1,7 @@
 # AKARI — AI Voice Assistant with Holographic Interface
 
 <div align="center">
-  <video src="https://github.com/SarangRao20/Akari-AI/raw/main/demo.mp4" controls="controls" muted="muted" autoplay="autoplay" width="100%"></video>
+  <video src="https://github.com/jay-2007-creater/jarvesa-/raw/main/demo.mp4" controls="controls" muted="muted" autoplay="autoplay" width="100%"></video>
 </div>
 
 A real-time, voice-to-voice holographic AI companion desktop assistant built on the **Google Gemini Live API**. AKARI combines a holographic video character, persistent memory, a reminder system, a full desktop automation agent, and an in-app browser — all running locally with a 3-process architecture.
@@ -526,7 +526,7 @@ cp .env.local .env
 
 ## How This Was Built
 
-Designed and developed by **Sarang (SarangRao20)** — an independent developer focused on AI-powered desktop automation. Features:
+Designed and developed by **jay-2007-creater** — an independent developer focused on AI-powered desktop automation. Features:
 - Holographic video character system + orb animation mode
 - Persistent memory with AI-powered extraction
 - Cross-platform desktop agent with 91 tools across 22 modules
@@ -545,4 +545,4 @@ Designed and developed by **Sarang (SarangRao20)** — an independent developer 
 
 ---
 
-*Built by Sarang*
+*Built by jay-2007-creater*
